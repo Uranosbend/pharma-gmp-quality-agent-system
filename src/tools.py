@@ -1415,7 +1415,15 @@ def generate_monthly_excel_report_impl() -> Dict[str, Any]:
 def search_sop_manuals(query: str) -> str:
     """Search local PDF Standard Operating Procedures using hybrid TF-IDF + BM25 RAG.
     Returns top matching SOP sections with exact PDF filename, SOP code, and page number."""
-    return json.dumps(search_sop_manuals_impl(query), indent=2)
+    res = search_sop_manuals_impl(query, top_k=3)
+    trimmed = {
+        **res,
+        "results": [
+            {**r, "excerpt": str(r.get("excerpt", ""))[:420]}
+            for r in res.get("results", [])
+        ],
+    }
+    return json.dumps(trimmed, indent=2)
 
 
 @tool
@@ -1475,7 +1483,9 @@ def run_qa_line_clearance(machine_id: str, ticket_id: str, final_vibration_rms: 
 @tool
 def log_incident_analytics(ticket_data: str) -> str:
     """Compute MTTR, labor, part, and production loss costs and log closed incident to SQLite incident_analytics."""
-    return json.dumps(log_incident_analytics_impl(ticket_data), indent=2)
+    res = dict(log_incident_analytics_impl(ticket_data))
+    res.pop("monthly_kpis_after_update", None)
+    return json.dumps(res, indent=2)
 
 
 @tool

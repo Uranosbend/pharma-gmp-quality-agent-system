@@ -225,6 +225,17 @@ class TestQualityAgentPipeline(unittest.TestCase):
         self.assertIsNone(err)
         self.assertEqual(models, ["openai/gpt-oss-120b", "qwen/qwen3.8-27b"])
 
+        # Strict live-only failover must never pick phantom catalog models when live models exist
+        from src.llm_config import parse_retry_after_seconds, resolve_fallback_model
+
+        with patch("src.llm_config.fetch_live_models", return_value=(["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"], None)):
+            nxt_1 = resolve_fallback_model("groq", "openai/gpt-oss-120b", "gsk_mock", tried_models=["openai/gpt-oss-120b"])
+            self.assertEqual(nxt_1, "openai/gpt-oss-20b")
+            nxt_2 = resolve_fallback_model("groq", "openai/gpt-oss-20b", "gsk_mock", tried_models=["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"])
+            self.assertIsNone(nxt_2)
+        self.assertAlmostEqual(parse_retry_after_seconds(RuntimeError("Please try again in 8.7825s")) or 0.0, 8.7825, places=3)
+        self.assertIsNone(parse_retry_after_seconds(RuntimeError("Please try again in 1m29.8s")))
+
         attempts = {"n": 0}
 
         def flaky() -> str:

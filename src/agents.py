@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import re
+import threading
+import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -15,8 +17,10 @@ from src.llm_config import (
     get_chat_model,
     invoke_structured_decision,
     invoke_with_retry,
+    is_daily_quota_exhausted_error,
     is_model_not_found_error,
     is_rate_limit_error,
+    parse_retry_after_seconds,
     resolve_fallback_model,
 )
 from src.seed_data import GMP_VIBRATION_LIMIT_RMS
@@ -126,26 +130,48 @@ def _make_trace(
 # ---------------------------------------------------------------------------
 
 
+def _extract_msg_text(msg: Any) -> str:
+    raw_content = getattr(msg, "content", "")
+    if isinstance(raw_content, list):
+        raw_content = " ".join(
+            str(part.get("text", part) if isinstance(part, dict) else part)
+            for part in raw_content
+        )
+    return str(raw_content)
+
+
 def _run_specialist_tool_loop(
-    llm: Any,
+    state: MaintenanceState,
     system_prompt: str,
     task_prompt: str,
     tools: List[Any],
     pacing_delay: float,
     max_rounds: int = 5,
-) -> Tuple[str, List[Dict[str, Any]]]:
-    """Execute a LangChain bind_tools ReAct loop with retry protection."""
+) -> Tuple[str, List[Dict[str, Any]], str]:
+    """Execute a LangChain bind_tools ReAct loop with per-turn 404/429 model fallback."""
     tool_map: Dict[str, Callable[..., Any]] = {t.name: t for t in tools}
-    llm_with_tools = llm.bind_tools(tools)
     messages: List[Any] = [
         SystemMessage(content=system_prompt),
         HumanMessage(content=task_prompt),
     ]
     executed_tools: List[Dict[str, Any]] = []
+    active_model = state["llm_model"]
 
     for _ in range(max_rounds):
+        def _turn_call(model_id: str) -> Any:
+            llm = get_chat_model(
+                provider=state["llm_provider"],
+                model=model_id,
+                api_key=state.get("api_key"),
+                temperature=0.0,
+            )
+            return invoke_with_retry(llm.bind_tools(tools).invoke, messages, pacing_delay=pacing_delay)
+
         try:
-            ai_msg = invoke_with_retry(llm_with_tools.invoke, messages, pacing_delay=pacing_delay)
+            ai_msg, active_model, _ = _invoke_live_with_model_fallback(
+                {**state, "llm_model": active_model},  # type: ignore[arg-type]
+                _turn_call,
+            )
         except Exception as tool_exc:
             low_err = str(tool_exc).lower()
             if any(
@@ -174,13 +200,7 @@ def _run_specialist_tool_loop(
 
         tool_calls = getattr(ai_msg, "tool_calls", None) or []
         if not tool_calls:
-            raw_content = getattr(ai_msg, "content", "")
-            if isinstance(raw_content, list):
-                raw_content = " ".join(
-                    str(part.get("text", part) if isinstance(part, dict) else part)
-                    for part in raw_content
-                )
-            return str(raw_content), executed_tools
+            return _extract_msg_text(ai_msg), executed_tools, active_model
 
         for tc in tool_calls:
             t_name = tc.get("name", "")
@@ -205,17 +225,24 @@ def _run_specialist_tool_loop(
             )
             messages.append(ToolMessage(content=obs_str, tool_call_id=t_id))
 
-    final_msg = invoke_with_retry(
-        llm.invoke,
-        messages + [HumanMessage(content="Provide your final JSON summary now based strictly on tool outputs.")],
-        pacing_delay=pacing_delay,
-    )
-    raw_final = getattr(final_msg, "content", "")
-    if isinstance(raw_final, list):
-        raw_final = " ".join(
-            str(part.get("text", part) if isinstance(part, dict) else part) for part in raw_final
+    def _final_call(model_id: str) -> Any:
+        llm = get_chat_model(
+            provider=state["llm_provider"],
+            model=model_id,
+            api_key=state.get("api_key"),
+            temperature=0.0,
         )
-    return str(raw_final), executed_tools
+        return invoke_with_retry(
+            llm.invoke,
+            messages + [HumanMessage(content="Provide your final JSON summary now based strictly on tool outputs.")],
+            pacing_delay=pacing_delay,
+        )
+
+    final_msg, active_model, _ = _invoke_live_with_model_fallback(
+        {**state, "llm_model": active_model},  # type: ignore[arg-type]
+        _final_call,
+    )
+    return _extract_msg_text(final_msg), executed_tools, active_model
 
 
 def _safe_parse_json(text: str) -> Dict[str, Any]:
@@ -226,41 +253,146 @@ def _safe_parse_json(text: str) -> Dict[str, Any]:
         return {}
 
 
+_RATE_LOCK = threading.Lock()
+_TPD_EXHAUSTED_UNTIL: Dict[Tuple[str, str], float] = {}
+_TPM_READY_AT: Dict[Tuple[str, str], float] = {}
+_IN_FLIGHT_MODELS: Dict[Tuple[str, str], int] = {}
+
+
+def _snapshot_rate_state(provider: str, now: float) -> Tuple[List[str], Dict[str, float], List[str]]:
+    """Snapshot TPD-cooled, TPM-busy, and active in-flight models for a provider."""
+    with _RATE_LOCK:
+        cooled = [m for (p, m), u in _TPD_EXHAUSTED_UNTIL.items() if p == provider and u > now]
+        busy = {m: r for (p, m), r in _TPM_READY_AT.items() if p == provider and r > now}
+        in_flight = [m for (p, m), c in _IN_FLIGHT_MODELS.items() if p == provider and c > 0]
+    return cooled, busy, in_flight
+
+
 def _invoke_live_with_model_fallback(
     state: MaintenanceState,
     call_fn: Callable[[str], Any],
 ) -> Tuple[Any, str, Optional[str]]:
-    """Invoke a live LLM action with automatic 404 model_not_found & 429 rate-limit recovery."""
+    """Thread-safe model scheduler rotating across accessible live models on 404/429 and waiting per-model on TPM bursts."""
     provider = state["llm_provider"]
-    current_model = state["llm_model"]
     api_key = state.get("api_key")
-    tried: List[str] = []
+    cooled, tpm_busy, in_flight = _snapshot_rate_state(provider, time.time())
 
-    for attempt in range(4):
+    current_model = state["llm_model"]
+    busy_set = set(cooled) | set(tpm_busy.keys())
+    if current_model in busy_set:
+        nxt_idle = resolve_fallback_model(
+            provider, "", api_key=api_key, tried_models=list(busy_set | set(in_flight))
+        )
+        if nxt_idle:
+            current_model = nxt_idle
+        else:
+            nxt_ready = resolve_fallback_model(
+                provider, "", api_key=api_key, tried_models=list(busy_set)
+            )
+            if nxt_ready:
+                current_model = nxt_ready
+            else:
+                warm_busy = {m: r for m, r in tpm_busy.items() if m not in cooled}
+                if warm_busy:
+                    best_m, best_t = min(warm_busy.items(), key=lambda kv: kv[1])
+                    time.sleep(min(max(0.5, best_t - time.time()), 16.0))
+                    with _RATE_LOCK:
+                        _TPM_READY_AT.pop((provider, best_m), None)
+                    current_model = best_m
+    elif current_model in in_flight:
+        nxt_idle = resolve_fallback_model(
+            provider, "", api_key=api_key, tried_models=list(busy_set | set(in_flight))
+        )
+        if nxt_idle and "qwen" not in nxt_idle.lower():
+            current_model = nxt_idle
+
+    tried: List[str] = []
+    not_found_models: set[str] = set()
+    non_tpd_ready: Dict[str, float] = {}
+    waits_used = 0
+    max_waits = 5
+
+    for _ in range(16):
+        attempted_model = current_model
+        with _RATE_LOCK:
+            _IN_FLIGHT_MODELS[(provider, attempted_model)] = _IN_FLIGHT_MODELS.get((provider, attempted_model), 0) + 1
         try:
-            result = call_fn(current_model)
+            result = call_fn(attempted_model)
+            with _RATE_LOCK:
+                _TPD_EXHAUSTED_UNTIL.pop((provider, attempted_model), None)
+                _TPM_READY_AT.pop((provider, attempted_model), None)
             note = (
-                f"Auto-switched model from '{state['llm_model']}' to accessible '{current_model}' after 404/429."
-                if current_model != state["llm_model"]
+                f"Auto-switched model from '{state['llm_model']}' to '{attempted_model}' after 404/429."
+                if attempted_model != state["llm_model"]
                 else None
             )
-            return result, current_model, note
+            return result, attempted_model, note
         except Exception as exc:
-            tried.append(current_model)
-            recoverable = is_model_not_found_error(exc) or is_rate_limit_error(exc)
-            if not recoverable or attempt >= 3:
-                if recoverable:
-                    avail, _ = fetch_live_models(provider, api_key)
-                    preview = ", ".join(avail[:5]) if avail else "none discovered"
-                    raise RuntimeError(
-                        f"Model '{current_model}' unavailable or rate-limited on {provider}. "
-                        f"Available models detected: [{preview}]. Original error: {exc}"
-                    ) from exc
+            is_404 = is_model_not_found_error(exc)
+            is_429 = is_rate_limit_error(exc)
+            if not (is_404 or is_429):
                 raise
-            nxt = resolve_fallback_model(provider, current_model, api_key=api_key, tried_models=tried)
+
+            if attempted_model not in tried:
+                tried.append(attempted_model)
+            if is_404:
+                not_found_models.add(attempted_model)
+            elif is_daily_quota_exhausted_error(exc):
+                with _RATE_LOCK:
+                    _TPD_EXHAUSTED_UNTIL[(provider, attempted_model)] = time.time() + 300.0
+            else:
+                ra = parse_retry_after_seconds(exc)
+                ready_at = time.time() + min(ra if ra is not None else 5.0, 15.0) + 0.8
+                with _RATE_LOCK:
+                    _TPM_READY_AT[(provider, attempted_model)] = ready_at
+                non_tpd_ready[attempted_model] = ready_at
+
+            cooled_now, busy_now, in_flight_now = _snapshot_rate_state(provider, time.time())
+            base_excl = set(tried) | set(cooled_now) | set(busy_now.keys()) | not_found_models
+            nxt = resolve_fallback_model(
+                provider, attempted_model, api_key=api_key, tried_models=list(base_excl | set(in_flight_now))
+            )
             if not nxt:
-                raise
-            current_model = nxt
+                nxt = resolve_fallback_model(
+                    provider, attempted_model, api_key=api_key, tried_models=list(base_excl)
+                )
+            if nxt:
+                current_model = nxt
+                continue
+
+            wait_pool = {
+                m: r
+                for m, r in {**busy_now, **non_tpd_ready}.items()
+                if m not in cooled_now and m not in not_found_models
+            }
+            if waits_used < max_waits and wait_pool:
+                best_model, best_ready_at = min(
+                    wait_pool.items(),
+                    key=lambda kv: kv[1] + (4.0 if "qwen" in kv[0].lower() else 0.0),
+                )
+                time.sleep(max(0.6, min(best_ready_at - time.time(), 16.0)))
+                with _RATE_LOCK:
+                    _TPM_READY_AT.pop((provider, best_model), None)
+                waits_used += 1
+                tried.clear()
+                non_tpd_ready.pop(best_model, None)
+                current_model = best_model
+                continue
+
+            avail, _ = fetch_live_models(provider, api_key)
+            preview = ", ".join(avail[:5]) if avail else "none discovered"
+            raise RuntimeError(
+                f"All accessible {provider} models [{preview}] exhausted rate/quota limits "
+                f"(last model '{attempted_model}'). Wait ~10s, switch to Google Gemini Free, or use Offline Safe Demo Mode. "
+                f"Details: {exc}"
+            ) from exc
+        finally:
+            with _RATE_LOCK:
+                rem = _IN_FLIGHT_MODELS.get((provider, attempted_model), 1) - 1
+                if rem <= 0:
+                    _IN_FLIGHT_MODELS.pop((provider, attempted_model), None)
+                else:
+                    _IN_FLIGHT_MODELS[(provider, attempted_model)] = rem
 
     raise RuntimeError("Exhausted live model fallback attempts.")
 
@@ -809,6 +941,76 @@ def _validate_gmp_invariants(
             reason,
         )
 
+    # Anti-Loop Invariant: NEVER re-run parallel_intake or initial diagnostic once diagnostic_done=True with valid SOP
+    if llm_decision.next_agent == "parallel_intake" and state.get("diagnostic_done"):
+        if no_part:
+            target = "FINISH" if analyt.get("logged_to_db") else "analyst_capa"
+            gate = "SIGNED_OFF" if target == "FINISH" else "APPROVED"
+            stage = "closure" if target == "FINISH" else "diagnostic"
+            reason = "Anti-Loop Invariant: Diagnostic already complete for no-part case; bypassing duplicate parallel_intake."
+            return (
+                OrchestratorDecision(
+                    next_agent=target,
+                    instruction="Diagnostic complete with no part required; proceed to KPI/CAPA logging and closure.",
+                    gate_decision=gate,
+                    reviewed_stage=stage,
+                    audit_notes=f"{llm_decision.audit_notes} [{reason}]",
+                ),
+                reason,
+            )
+        reason = "Anti-Loop Invariant: Diagnostic & intake already complete; advancing to Stock Agent."
+        return (
+            OrchestratorDecision(
+                next_agent="stock_agent",
+                instruction=f"Check inventory and prepare SQL reservation for {diag.get('required_part_code', '')}.",
+                gate_decision="APPROVED",
+                reviewed_stage="diagnostic",
+                audit_notes=f"{llm_decision.audit_notes} [{reason}]",
+            ),
+            reason,
+        )
+
+    post_rms_fail = bool(
+        maint
+        and maint.get("post_repair_vibration_rms") is not None
+        and float(maint["post_repair_vibration_rms"]) > GMP_VIBRATION_LIMIT_RMS
+    )
+    if (
+        llm_decision.next_agent == "diagnostic_engineer"
+        and state.get("diagnostic_done")
+        and diag.get("sop_code")
+        and diag.get("root_cause")
+        and not state.get("escalation_to_engineer")
+        and not post_rms_fail
+    ):
+        if no_part:
+            target = "FINISH" if analyt.get("logged_to_db") else "analyst_capa"
+            gate = "SIGNED_OFF" if target == "FINISH" else "APPROVED"
+            stage = "closure" if target == "FINISH" else "diagnostic"
+            reason = "Anti-Loop Invariant: Valid SOP diagnosis already complete (no part required); advancing to Analyst/CAPA."
+            return (
+                OrchestratorDecision(
+                    next_agent=target,
+                    instruction="Valid SOP diagnostic complete with no part required; log KPIs and close protocol.",
+                    gate_decision=gate,
+                    reviewed_stage=stage,
+                    audit_notes=f"{llm_decision.audit_notes} [{reason}]",
+                ),
+                reason,
+            )
+        if not inv.get("reserved"):
+            reason = "Anti-Loop Invariant: Valid SOP diagnosis already complete; advancing to Stock Agent."
+            return (
+                OrchestratorDecision(
+                    next_agent="stock_agent",
+                    instruction=f"Verify SQLite inventory and reserve {diag.get('required_part_code', '')}.",
+                    gate_decision="APPROVED",
+                    reviewed_stage="diagnostic",
+                    audit_notes=f"{llm_decision.audit_notes} [{reason}]",
+                ),
+                reason,
+            )
+
     # Stage-flag normalization ONLY (never changes next_agent or LLM reasoning)
     norm_stage = llm_decision.reviewed_stage
     norm_gate = llm_decision.gate_decision
@@ -1075,6 +1277,7 @@ def orchestrator_node(state: MaintenanceState) -> Dict[str, Any]:
                 "- 'FINISH': Close protocol as SIGNED_OFF (only after mandatory checks + analytics logged) or ESCALATED.\n\n"
                 "Dynamic Decision Rules:\n"
                 "0. CLOSURE CHECK FIRST: If analytics_logged_to_db is True, IMMEDIATELY return next_agent='FINISH', gate_decision='SIGNED_OFF', reviewed_stage='closure'. NEVER invoke 'analyst_capa' a second time!\n"
+                "0B. NEVER choose 'parallel_intake' if diagnostic_done is True or precheck_done is True. Once diagnostic_done=True with valid sop_code & required_part_code != 'NONE' and inventory_summary.reserved is not True, route straight to 'stock_agent'.\n"
                 "1. If vibration <= 2.5 mm/s or symptom sounds non-mechanical/sensor-check and diagnostic_done=False -> choose 'diagnostic_engineer' directly (skip precheck).\n"
                 "2. If diagnostic_summary indicates required_part_code == 'NONE' or no_part_required=True -> bypass 'stock_agent', 'field_technician', and 'qa_clearance'; route straight to 'analyst_capa'.\n"
                 "3. If diagnostic_summary lacks valid sop_code or clear root_cause -> route back to 'diagnostic_engineer' with gate_decision='REJECTED' and tell it what to search.\n"
@@ -1082,7 +1285,7 @@ def orchestrator_node(state: MaintenanceState) -> Dict[str, Any]:
                 "5. Once inventory_summary.reserved is True and maintenance_summary is empty -> route to 'field_technician' (do NOT re-run stock_agent).\n"
                 "6. If Tier-1 Technician returned post_repair_vibration_rms > 2.5 mm/s -> REJECT gate and escalate UP to 'diagnostic_engineer' for engineering_replan, then back to 'field_technician'.\n"
                 "7. Never sign off ('FINISH' / 'SIGNED_OFF') while analytics_logged_to_db is False or while RMS > 2.5 mm/s.\n"
-                "Return valid OrchestratorDecision JSON with clear, specific 'instruction' and evidence-citing 'audit_notes'."
+                "Return strictly ONE valid JSON object with keys: next_agent ('parallel_intake'|'diagnostic_engineer'|'stock_agent'|'field_technician'|'qa_clearance'|'analyst_capa'|'FINISH'), instruction (string), gate_decision ('PENDING'|'APPROVED'|'REJECTED'|'ESCALATED'|'AWAITING_HUMAN'|'SIGNED_OFF'), reviewed_stage ('intake'|'diagnostic'|'stock'|'maintenance'|'engineering_replan'|'clearance'|'analyst'|'closure'), audit_notes (string)."
                 + _lang_prompt_hint(state)
             )
 
@@ -1385,22 +1588,13 @@ def diagnostic_engineer_node(state: MaintenanceState) -> Dict[str, Any]:
                     f"Conductor Instruction: {state.get('current_instruction')}"
                 )
 
-                def _call_replan(model_id: str) -> Tuple[str, List[Dict[str, Any]]]:
-                    llm = get_chat_model(
-                        provider=state["llm_provider"],
-                        model=model_id,
-                        api_key=state.get("api_key"),
-                        temperature=0.0,
-                    )
-                    return _run_specialist_tool_loop(
-                        llm=llm,
-                        system_prompt=sys_prompt,
-                        task_prompt=task_prompt,
-                        tools=[search_sop_manuals],
-                        pacing_delay=float(state.get("pacing_delay_sec", 0.3)),
-                    )
-
-                (raw_text, executed_tools), effective_model, _ = _invoke_live_with_model_fallback(state, _call_replan)
+                raw_text, executed_tools, effective_model = _run_specialist_tool_loop(
+                    state=state,
+                    system_prompt=sys_prompt,
+                    task_prompt=task_prompt,
+                    tools=[search_sop_manuals],
+                    pacing_delay=float(state.get("pacing_delay_sec", 0.3)),
+                )
                 for ex in executed_tools:
                     new_tool_calls.append({"agent": "Reliability Engineer (Tier 2)", **ex})
                 raw_llm_json = _safe_parse_json(raw_text)
@@ -1536,22 +1730,13 @@ def diagnostic_engineer_node(state: MaintenanceState) -> Dict[str, Any]:
                 f"Symptom / Observation: {state['symptom_summary']}"
             )
 
-            def _call_diag(model_id: str) -> Tuple[str, List[Dict[str, Any]]]:
-                llm = get_chat_model(
-                    provider=state["llm_provider"],
-                    model=model_id,
-                    api_key=state.get("api_key"),
-                    temperature=0.0,
-                )
-                return _run_specialist_tool_loop(
-                    llm=llm,
-                    system_prompt=sys_prompt,
-                    task_prompt=task_prompt,
-                    tools=[read_sensor_telemetry, search_sop_manuals],
-                    pacing_delay=float(state.get("pacing_delay_sec", 0.3)),
-                )
-
-            (raw_text, executed_tools), effective_model, _ = _invoke_live_with_model_fallback(state, _call_diag)
+            raw_text, executed_tools, effective_model = _run_specialist_tool_loop(
+                state=state,
+                system_prompt=sys_prompt,
+                task_prompt=task_prompt,
+                tools=[read_sensor_telemetry, search_sop_manuals],
+                pacing_delay=float(state.get("pacing_delay_sec", 0.3)),
+            )
             for ex in executed_tools:
                 new_tool_calls.append({"agent": "Reliability Engineer (Tier 2)", **ex})
             raw_llm_json = _safe_parse_json(raw_text)
@@ -1597,8 +1782,11 @@ def diagnostic_engineer_node(state: MaintenanceState) -> Dict[str, Any]:
                 required_part = "NONE"
                 is_no_part = True
 
-    sop_code = str(raw_llm_json.get("sop_code") or top_hit.get("sop_code") or sc.get("expected_sop_code") or "SOP-MNT-001")
-    sop_filename = str(raw_llm_json.get("sop_filename") or top_hit.get("filename") or "")
+    _placeholders = {"", "NONE", "N/A", "NA", "NULL", "UNKNOWN"}
+    raw_sop_code = str(raw_llm_json.get("sop_code") or "").strip()
+    sop_code = raw_sop_code if raw_sop_code.upper() not in _placeholders else str(top_hit.get("sop_code") or sc.get("expected_sop_code") or "SOP-MNT-001")
+    raw_sop_file = str(raw_llm_json.get("sop_filename") or "").strip()
+    sop_filename = raw_sop_file if raw_sop_file.upper() not in _placeholders else str(top_hit.get("filename") or "")
     try:
         page_num = int(raw_llm_json.get("page_number") or top_hit.get("page_number") or sc.get("expected_sop_page") or 1)
     except (TypeError, ValueError):
@@ -1757,22 +1945,13 @@ def stock_precheck_node(state: MaintenanceState) -> Dict[str, Any]:
             )
             task_prompt = f"Machine: {machine_id} | Ticket: {state['ticket_id']}"
 
-            def _call_precheck(model_id: str) -> Tuple[str, List[Dict[str, Any]]]:
-                llm = get_chat_model(
-                    provider=state["llm_provider"],
-                    model=model_id,
-                    api_key=state.get("api_key"),
-                    temperature=0.0,
-                )
-                return _run_specialist_tool_loop(
-                    llm=llm,
-                    system_prompt=sys_prompt,
-                    task_prompt=task_prompt,
-                    tools=[assess_batch_risk, query_inventory_sql],
-                    pacing_delay=float(state.get("pacing_delay_sec", 0.3)),
-                )
-
-            (raw_text, executed_tools), effective_model, _ = _invoke_live_with_model_fallback(state, _call_precheck)
+            raw_text, executed_tools, effective_model = _run_specialist_tool_loop(
+                state=state,
+                system_prompt=sys_prompt,
+                task_prompt=task_prompt,
+                tools=[assess_batch_risk, query_inventory_sql],
+                pacing_delay=float(state.get("pacing_delay_sec", 0.3)),
+            )
             for ex in executed_tools:
                 new_tool_calls.append({"agent": "Batch & Stock Pre-Check", **ex})
             raw_llm_json = _safe_parse_json(raw_text)
@@ -1996,22 +2175,13 @@ def stock_agent_node(state: MaintenanceState) -> Dict[str, Any]:
             )
             task_prompt = f"Ticket: {ticket_id} | Required Part: {req_part}\nInstruction: {state.get('current_instruction')}"
 
-            def _call_stock(model_id: str) -> Tuple[str, List[Dict[str, Any]]]:
-                llm = get_chat_model(
-                    provider=state["llm_provider"],
-                    model=model_id,
-                    api_key=state.get("api_key"),
-                    temperature=0.0,
-                )
-                return _run_specialist_tool_loop(
-                    llm=llm,
-                    system_prompt=sys_prompt,
-                    task_prompt=task_prompt,
-                    tools=active_tools,
-                    pacing_delay=float(state.get("pacing_delay_sec", 0.3)),
-                )
-
-            (raw_text, executed_tools), effective_model, _ = _invoke_live_with_model_fallback(state, _call_stock)
+            raw_text, executed_tools, effective_model = _run_specialist_tool_loop(
+                state=state,
+                system_prompt=sys_prompt,
+                task_prompt=task_prompt,
+                tools=active_tools,
+                pacing_delay=float(state.get("pacing_delay_sec", 0.3)),
+            )
             for ex in executed_tools:
                 new_tool_calls.append({"agent": "Stock & Procurement", **ex})
             raw_llm_json = _safe_parse_json(raw_text)
@@ -2325,22 +2495,13 @@ def field_technician_node(state: MaintenanceState) -> Dict[str, Any]:
                 f"Instruction: {state.get('current_instruction')}"
             )
 
-            def _call_tech(model_id: str) -> Tuple[str, List[Dict[str, Any]]]:
-                llm = get_chat_model(
-                    provider=state["llm_provider"],
-                    model=model_id,
-                    api_key=state.get("api_key"),
-                    temperature=0.0,
-                )
-                return _run_specialist_tool_loop(
-                    llm=llm,
-                    system_prompt=sys_prompt,
-                    task_prompt=task_prompt,
-                    tools=[execute_part_replacement, run_post_repair_vibration_test],
-                    pacing_delay=float(state.get("pacing_delay_sec", 0.3)),
-                )
-
-            (raw_text, executed_tools), effective_model, _ = _invoke_live_with_model_fallback(state, _call_tech)
+            raw_text, executed_tools, effective_model = _run_specialist_tool_loop(
+                state=state,
+                system_prompt=sys_prompt,
+                task_prompt=task_prompt,
+                tools=[execute_part_replacement, run_post_repair_vibration_test],
+                pacing_delay=float(state.get("pacing_delay_sec", 0.3)),
+            )
             for ex in executed_tools:
                 new_tool_calls.append({"agent": "Field Technician (Tier 1)", **ex})
             raw_llm_json = _safe_parse_json(raw_text)
@@ -2501,22 +2662,13 @@ def qa_clearance_node(state: MaintenanceState) -> Dict[str, Any]:
             )
             task_prompt = f"Ticket: {ticket_id} | Machine: {machine_id} | Final RMS: {final_rms}"
 
-            def _call_clear(model_id: str) -> Tuple[str, List[Dict[str, Any]]]:
-                llm = get_chat_model(
-                    provider=state["llm_provider"],
-                    model=model_id,
-                    api_key=state.get("api_key"),
-                    temperature=0.0,
-                )
-                return _run_specialist_tool_loop(
-                    llm=llm,
-                    system_prompt=sys_prompt,
-                    task_prompt=task_prompt,
-                    tools=[run_qa_line_clearance],
-                    pacing_delay=float(state.get("pacing_delay_sec", 0.3)),
-                )
-
-            (raw_text, executed_tools), effective_model, _ = _invoke_live_with_model_fallback(state, _call_clear)
+            raw_text, executed_tools, effective_model = _run_specialist_tool_loop(
+                state=state,
+                system_prompt=sys_prompt,
+                task_prompt=task_prompt,
+                tools=[run_qa_line_clearance],
+                pacing_delay=float(state.get("pacing_delay_sec", 0.3)),
+            )
             for ex in executed_tools:
                 new_tool_calls.append({"agent": "QA Line Clearance", **ex})
             raw_llm_json = _safe_parse_json(raw_text)
@@ -2678,22 +2830,13 @@ def analyst_capa_node(state: MaintenanceState) -> Dict[str, Any]:
                 f"Instruction: {state.get('current_instruction')}"
             )
 
-            def _call_analyst(model_id: str) -> Tuple[str, List[Dict[str, Any]]]:
-                llm = get_chat_model(
-                    provider=state["llm_provider"],
-                    model=model_id,
-                    api_key=state.get("api_key"),
-                    temperature=0.0,
-                )
-                return _run_specialist_tool_loop(
-                    llm=llm,
-                    system_prompt=sys_prompt,
-                    task_prompt=task_prompt,
-                    tools=[log_incident_analytics, create_capa_if_repeat_failure, generate_monthly_excel_report],
-                    pacing_delay=float(state.get("pacing_delay_sec", 0.3)),
-                )
-
-            (raw_text, executed_tools), effective_model, _ = _invoke_live_with_model_fallback(state, _call_analyst)
+            raw_text, executed_tools, effective_model = _run_specialist_tool_loop(
+                state=state,
+                system_prompt=sys_prompt,
+                task_prompt=task_prompt,
+                tools=[log_incident_analytics, create_capa_if_repeat_failure, generate_monthly_excel_report],
+                pacing_delay=float(state.get("pacing_delay_sec", 0.3)),
+            )
             for ex in executed_tools:
                 new_tool_calls.append({"agent": "Quality & CAPA Analyst", **ex})
             raw_llm_json = _safe_parse_json(raw_text)

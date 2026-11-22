@@ -18,15 +18,13 @@ T = TypeVar("T", bound=BaseModel)
 PROVIDER_CATALOG: Dict[str, Dict[str, Any]] = {
     "groq": {
         "label": "Groq Free (Recommended)",
-        "default_model": "openai/gpt-oss-120b",
+        "default_model": "openai/gpt-oss-20b",
         "models": [
-            "openai/gpt-oss-120b",
             "openai/gpt-oss-20b",
+            "openai/gpt-oss-120b",
             "qwen/qwen3.8-27b",
-            "llama-3.3-70b-versatile",
-            "llama-3.1-8b-instant",
         ],
-        "default_pacing_sec": 0.3,
+        "default_pacing_sec": 0.8,
         "env_keys": ["GROQ_API_KEY"],
         "requires_key": True,
     },
@@ -124,11 +122,10 @@ def _sort_models_by_preference(discovered: List[str], preferred: List[str]) -> L
     return sorted(unique, key=lambda m: (rank.get(m, 999), m))
 
 
-def fetch_live_models(provider: str, api_key: Optional[str] = None) -> Tuple[List[str], Optional[str]]:
-    """Query the provider's live model catalog for the supplied API key/endpoint."""
-    fallback = list(PROVIDER_CATALOG.get(provider, {}).get("models", []))
-    resolved_key, _ = resolve_api_key(provider, api_key)
+_LIVE_MODELS_CACHE: Dict[Tuple[str, str], Tuple[float, List[str]]] = {}
 
+
+def _fetch_live_models_uncached(provider: str, resolved_key: Optional[str], fallback: List[str]) -> Tuple[List[str], Optional[str]]:
     if provider == "groq":
         if not resolved_key:
             return fallback, "No Groq API key supplied."
@@ -197,21 +194,52 @@ def fetch_live_models(provider: str, api_key: Optional[str] = None) -> Tuple[Lis
     return fallback, None
 
 
+def fetch_live_models(provider: str, api_key: Optional[str] = None) -> Tuple[List[str], Optional[str]]:
+    """Query the provider's live model catalog for the supplied API key/endpoint (60s process cache)."""
+    fallback = list(PROVIDER_CATALOG.get(provider, {}).get("models", []))
+    resolved_key, _ = resolve_api_key(provider, api_key)
+    cacheable = bool(resolved_key) and not str(resolved_key).startswith("gsk_mock")
+    cache_key = (provider, str(resolved_key or ""))
+    if cacheable and cache_key in _LIVE_MODELS_CACHE:
+        ts, cached_models = _LIVE_MODELS_CACHE[cache_key]
+        if time.time() - ts < 60.0 and cached_models:
+            return list(cached_models), None
+
+    models, err = _fetch_live_models_uncached(provider, resolved_key, fallback)
+    if cacheable and err is None and models:
+        _LIVE_MODELS_CACHE[cache_key] = (time.time(), list(models))
+    return models, err
+
+
 def is_rate_limit_error(exc: Exception) -> bool:
-    """Detect HTTP 429 / TPM / TPD rate limit errors."""
+    """Detect HTTP 429 / TPM / OTPM / TPD rate limit errors."""
     msg = f"{type(exc).__name__}: {exc}".lower()
     markers = (
         "429",
         "rate_limit",
         "rate limit",
         "tokens per minute",
+        "output tokens per minute",
         "tokens per day",
         "(tpd)",
         "(tpm)",
+        "(otpm)",
         "quota",
         "too many requests",
     )
     return any(m in msg for m in markers)
+
+
+def parse_retry_after_seconds(exc: Exception) -> Optional[float]:
+    """Parse short Groq/provider wait duration like 'try again in 8.78s' (returns None if >35s)."""
+    msg = f"{exc}".lower()
+    m = re.search(r"try again in\s+(?:(\d+)\s*m)?\s*(\d+(?:\.\d+)?)\s*s", msg)
+    if not m:
+        return None
+    mins = int(m.group(1) or 0)
+    secs = float(m.group(2))
+    total = mins * 60.0 + secs
+    return total if 0.0 < total <= 35.0 else None
 
 
 def is_daily_quota_exhausted_error(exc: Exception) -> bool:
@@ -243,29 +271,29 @@ def resolve_fallback_model(
     api_key: Optional[str] = None,
     tried_models: Optional[List[str]] = None,
 ) -> Optional[str]:
-    """Find an accessible fallback model when the selected model returns 404 or 429."""
+    """Find an accessible fallback model using live provider discovery first (no stale 404 entries)."""
     excluded = {failed_model} | set(tried_models or [])
-    live_models, _ = fetch_live_models(provider, api_key)
+    live_models, live_err = fetch_live_models(provider, api_key)
     if provider == "groq" and live_models:
         preferred = (
             "openai/gpt-oss-20b",
-            "llama-3.1-8b-instant",
-            "qwen/qwen3-32b",
-            "qwen/qwen3.8-27b",
             "openai/gpt-oss-120b",
-            "llama-3.3-70b-versatile",
+            "qwen/qwen3.8-27b",
         )
         live_set = set(live_models)
         ordered = [m for m in preferred if m in live_set] + [m for m in live_models if m not in preferred]
     else:
-        ordered = live_models
+        ordered = list(live_models)
 
     for m in ordered:
         if m not in excluded:
             return m
-    for m in PROVIDER_CATALOG.get(provider, {}).get("models", []):
-        if m not in excluded:
-            return m
+
+    # Only consult static catalog if live discovery failed completely
+    if live_err is not None or not live_models:
+        for m in PROVIDER_CATALOG.get(provider, {}).get("models", []):
+            if m not in excluded:
+                return m
     return None
 
 
@@ -285,13 +313,22 @@ def get_chat_model(
             )
         from langchain_groq import ChatGroq
 
-        return ChatGroq(
-            model=model,
-            api_key=resolved_key,
-            temperature=temperature,
-            max_retries=0,
-            timeout=25,
-        )
+        groq_kwargs: Dict[str, Any] = {
+            "model": model,
+            "api_key": resolved_key,
+            "temperature": temperature,
+            "max_retries": 0,
+            "timeout": 25,
+        }
+        low_m = model.lower()
+        if "gpt-oss" in low_m:
+            groq_kwargs["max_tokens"] = 700
+            groq_kwargs["reasoning_effort"] = "low"
+        elif "qwen" in low_m:
+            groq_kwargs["max_tokens"] = 320
+        else:
+            groq_kwargs["max_tokens"] = 700
+        return ChatGroq(**groq_kwargs)
 
     if provider == "gemini":
         if not resolved_key:
@@ -347,12 +384,12 @@ def _is_transient_rate_or_network_error(exc: Exception) -> bool:
 def invoke_with_retry(
     callable_fn: Callable[..., Any],
     *args: Any,
-    pacing_delay: float = 0.3,
-    max_retries: int = 2,
-    base_delay: float = 1.2,
+    pacing_delay: float = 0.8,
+    max_retries: int = 1,
+    base_delay: float = 1.0,
     **kwargs: Any,
 ) -> Any:
-    """Execute an LLM call with configurable pacing and fast exponential backoff on 429s."""
+    """Execute an LLM call with pacing and fast 429 handover across live fallback models."""
     if pacing_delay > 0:
         time.sleep(pacing_delay)
 
@@ -362,7 +399,13 @@ def invoke_with_retry(
             return callable_fn(*args, **kwargs)
         except Exception as exc:
             last_exc = exc
-            if is_daily_quota_exhausted_error(exc) or attempt >= max_retries or not _is_transient_rate_or_network_error(exc):
+            retry_after = parse_retry_after_seconds(exc)
+            if (
+                is_daily_quota_exhausted_error(exc)
+                or (retry_after is not None and retry_after > 4.0 and attempt == 0 and max_retries <= 2)
+                or attempt >= max_retries
+                or not _is_transient_rate_or_network_error(exc)
+            ):
                 raise
             sleep_sec = min(base_delay * (2**attempt) + random.uniform(0.1, 0.5), 4.0)
             time.sleep(sleep_sec)
@@ -391,42 +434,44 @@ def invoke_structured_decision(
     pacing_delay: float = 0.3,
 ) -> T:
     """Obtain a Pydantic-validated structured output with JSON text fallback."""
-    try:
-        structured_llm = llm.with_structured_output(schema_cls)
-        result = invoke_with_retry(structured_llm.invoke, messages, pacing_delay=pacing_delay)
-        if isinstance(result, schema_cls):
-            return result
-        if isinstance(result, dict):
-            return schema_cls.model_validate(result)
-    except Exception as first_err:
-        if _is_transient_rate_or_network_error(first_err) or is_model_not_found_error(first_err):
-            raise
-        from langchain_core.messages import HumanMessage
+    from langchain_core.messages import HumanMessage
 
-        fields_list = ", ".join(getattr(schema_cls, "model_fields", {}).keys())
-        json_guard = HumanMessage(
-            content=(
-                f"Respond strictly with ONE valid JSON object (no markdown, no prose) containing keys: {fields_list}. "
-                "Every string field must be a plain string (not a list)."
-            )
+    fields_list = ", ".join(getattr(schema_cls, "model_fields", {}).keys())
+    json_guard = HumanMessage(
+        content=(
+            f"Respond strictly with ONE valid JSON object (no markdown, no prose) containing keys: {fields_list}. "
+            "Every string field must be a plain string (not a list)."
         )
-        try:
-            json_llm = llm.with_structured_output(schema_cls, method="json_mode")
-            res2 = invoke_with_retry(json_llm.invoke, list(messages) + [json_guard], pacing_delay=pacing_delay)
-            if isinstance(res2, schema_cls):
-                return res2
-            if isinstance(res2, dict):
-                return schema_cls.model_validate(res2)
-        except Exception as second_err:
-            if _is_transient_rate_or_network_error(second_err) or is_model_not_found_error(second_err):
-                raise
-        raw_msg = invoke_with_retry(llm.invoke, list(messages) + [json_guard], pacing_delay=pacing_delay)
-        content = getattr(raw_msg, "content", str(raw_msg))
-        if isinstance(content, list):
-            content = " ".join(
-                str(part.get("text", part) if isinstance(part, dict) else part) for part in content
-            )
-        data = extract_json_object(str(content))
-        return schema_cls.model_validate(data)
+    )
+    guarded_messages = list(messages) + [json_guard]
+    is_groq = llm.__class__.__name__ == "ChatGroq"
+    attempts = (
+        [("json_mode", guarded_messages), (None, messages)]
+        if is_groq
+        else [(None, messages), ("json_mode", guarded_messages)]
+    )
 
-    raise ValueError(f"Could not validate structured response into {schema_cls.__name__}")
+    for method_name, attempt_msgs in attempts:
+        try:
+            structured_llm = (
+                llm.with_structured_output(schema_cls, method=method_name)
+                if method_name
+                else llm.with_structured_output(schema_cls)
+            )
+            result = invoke_with_retry(structured_llm.invoke, attempt_msgs, pacing_delay=pacing_delay)
+            if isinstance(result, schema_cls):
+                return result
+            if isinstance(result, dict):
+                return schema_cls.model_validate(result)
+        except Exception as err:
+            if _is_transient_rate_or_network_error(err) or is_model_not_found_error(err):
+                raise
+
+    raw_msg = invoke_with_retry(llm.invoke, guarded_messages, pacing_delay=pacing_delay)
+    content = getattr(raw_msg, "content", str(raw_msg))
+    if isinstance(content, list):
+        content = " ".join(
+            str(part.get("text", part) if isinstance(part, dict) else part) for part in content
+        )
+    data = extract_json_object(str(content))
+    return schema_cls.model_validate(data)
