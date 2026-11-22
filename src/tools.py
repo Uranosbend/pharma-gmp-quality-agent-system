@@ -63,6 +63,8 @@ class RunContext:
     reservations: List[Dict[str, Any]] = field(default_factory=list)
     maintenance_attempts: List[Dict[str, Any]] = field(default_factory=list)
     telemetry_readings: List[Dict[str, Any]] = field(default_factory=list)
+    batch_risk_report: Optional[Dict[str, Any]] = None
+    clearance_report: Optional[Dict[str, Any]] = None
     analytics_report: Optional[Dict[str, Any]] = None
     excel_path: Optional[str] = None
     audit_step_counter: int = 0
@@ -432,13 +434,26 @@ def read_sensor_telemetry_impl(machine_id: str) -> Dict[str, Any]:
     status = "NORMAL"
 
     if ctx is not None and ctx.machine_id.upper() == clean_id:
-        sc = DEMO_SCENARIOS.get(ctx.scenario_id, {})
         alarm_rms = ctx.latest_vibration_rms if ctx.latest_vibration_rms is not None else ctx.alarm_vibration_rms
-        temp_c = float(sc.get("temperature_c", 68.0))
-        dom_freq = float(sc.get("dominant_frequency_hz", 180.0))
-        peak_g = float(sc.get("peak_accel_g", 3.5))
-        kurtosis = float(sc.get("kurtosis", 5.2))
-        motor_amps = float(sc.get("motor_amps", 20.0))
+        if ctx.scenario_id in DEMO_SCENARIOS:
+            sc = DEMO_SCENARIOS[ctx.scenario_id]
+            temp_c = float(sc.get("temperature_c", 68.0))
+            dom_freq = float(sc.get("dominant_frequency_hz", 180.0))
+            peak_g = float(sc.get("peak_accel_g", 3.5))
+            kurtosis = float(sc.get("kurtosis", 5.2))
+            motor_amps = float(sc.get("motor_amps", 20.0))
+        elif alarm_rms <= float(row["gmp_vibration_limit_rms"]):
+            temp_c = 46.0
+            dom_freq = 50.0
+            peak_g = 0.65
+            kurtosis = 3.1
+            motor_amps = 16.2
+        else:
+            temp_c = 64.0
+            dom_freq = 155.0
+            peak_g = 3.2
+            kurtosis = 4.9
+            motor_amps = 21.0
         symptom = ctx.symptom_summary
         status = "CRITICAL_ALARM" if alarm_rms > float(row["gmp_vibration_limit_rms"]) else "WITHIN_GMP_LIMIT"
 
@@ -713,7 +728,7 @@ def run_post_repair_vibration_test_impl(machine_id: str) -> Dict[str, Any]:
         attempt_num = ctx.vibration_test_count
         sc = DEMO_SCENARIOS.get(ctx.scenario_id, {})
         fail_rms = sc.get("fail_attempt1_rms")
-        pass_rms = float(sc.get("post_repair_pass_rms") or 1.4)
+        pass_rms = float(sc.get("post_repair_pass_rms") or (1.3 if ctx.scenario_id == "custom_unseen" else 1.4))
 
         if ctx.inject_post_repair_fail and attempt_num == 1:
             measured_rms = float(fail_rms if fail_rms is not None else 4.8)
@@ -795,49 +810,62 @@ def log_incident_analytics_impl(ticket_data: Any) -> Dict[str, Any]:
         downtime_rate = float(m_row["downtime_cost_per_min"])
 
         # Reconcile authoritative telemetry & parts from RunContext / DB
-        repair_attempts = int(
-            parsed.get("repair_attempts")
-            or (max(1, ctx.vibration_test_count) if ctx else 1)
-        )
-        first_time_fix = 1 if repair_attempts == 1 else 0
+        if "repair_attempts" in parsed and parsed["repair_attempts"] is not None:
+            repair_attempts = int(parsed["repair_attempts"])
+        else:
+            repair_attempts = max(1, ctx.vibration_test_count) if ctx else 1
+        first_time_fix = 1 if repair_attempts <= 1 else 0
 
-        part_used = str(parsed.get("part_used") or (ctx.part_used if ctx and ctx.part_used else "BRG-4402"))
-        used_alternative = int(
-            bool(parsed.get("used_alternative"))
-            or (ctx.used_alternative if ctx else part_used.endswith("-ALT"))
+        raw_part = str(parsed.get("part_used") or (ctx.part_used if ctx and ctx.part_used else "BRG-4402")).strip()
+        is_no_part = raw_part.upper() in ("NONE", "N/A", "CALIBRATION_ONLY", "NO_PART") or repair_attempts == 0
+        part_used = "NONE" if is_no_part else raw_part
+        used_alternative = (
+            0
+            if is_no_part
+            else int(bool(parsed.get("used_alternative")) or (ctx.used_alternative if ctx else part_used.endswith("-ALT")))
         )
 
         # Look up actual unit cost from DB if needed
-        p_row = conn.execute(
-            "SELECT unit_cost_usd FROM spare_parts_inventory WHERE UPPER(part_code) = ?",
-            (part_used.upper(),),
-        ).fetchone()
-        part_cost_usd = float(
-            parsed.get("part_cost_usd")
-            or (ctx.part_cost_usd if ctx and ctx.part_cost_usd > 0 else (p_row["unit_cost_usd"] if p_row else 350.0))
-        )
+        if is_no_part:
+            part_cost_usd = 0.0
+        else:
+            p_row = conn.execute(
+                "SELECT unit_cost_usd FROM spare_parts_inventory WHERE UPPER(part_code) = ?",
+                (part_used.upper(),),
+            ).fetchone()
+            part_cost_usd = float(
+                parsed.get("part_cost_usd")
+                or (ctx.part_cost_usd if ctx and ctx.part_cost_usd > 0 else (p_row["unit_cost_usd"] if p_row else 350.0))
+            )
 
         alarm_rms = float(
             parsed.get("alarm_vibration_rms")
-            or (ctx.alarm_vibration_rms if ctx else 9.0)
+            if parsed.get("alarm_vibration_rms") is not None
+            else (ctx.alarm_vibration_rms if ctx else 9.0)
         )
         final_rms = float(
             parsed.get("final_vibration_rms")
-            or (ctx.latest_vibration_rms if ctx and ctx.latest_vibration_rms is not None else 1.5)
+            if parsed.get("final_vibration_rms") is not None
+            else (ctx.latest_vibration_rms if ctx and ctx.latest_vibration_rms is not None else (alarm_rms if is_no_part else 1.5))
         )
 
         base_downtime_map = {"TP-01": 68, "RP-04": 62, "PK-02": 56}
-        default_dt = base_downtime_map.get(machine_id, 60) + (repair_attempts - 1) * 48
-        downtime_minutes = int(parsed.get("downtime_minutes") or default_dt)
-        if downtime_minutes < 15:
-            downtime_minutes = default_dt
-
-        labor_hours = 1.5 if repair_attempts == 1 else 1.5 + (repair_attempts - 1) * 2.0
+        if is_no_part:
+            downtime_minutes = int(parsed.get("downtime_minutes") or 10)
+            labor_hours = 0.25
+        else:
+            default_dt = base_downtime_map.get(machine_id, 60) + (repair_attempts - 1) * 48
+            downtime_minutes = int(parsed.get("downtime_minutes") or default_dt)
+            if downtime_minutes < 15:
+                downtime_minutes = default_dt
+            labor_hours = 1.5 if repair_attempts == 1 else 1.5 + (repair_attempts - 1) * 2.0
         labor_cost_usd = round(labor_hours * LABOR_RATE_USD_PER_HR, 2)
         production_loss_usd = round(downtime_minutes * downtime_rate, 2)
         total_cost_usd = round(part_cost_usd + labor_cost_usd + production_loss_usd, 2)
 
-        if total_cost_usd >= 8500.0:
+        if is_no_part:
+            severity = "Low"
+        elif total_cost_usd >= 8500.0:
             severity = "Critical"
         elif total_cost_usd >= 5000.0 or repair_attempts > 1:
             severity = "High"
@@ -955,7 +983,11 @@ def assess_batch_risk_impl(machine_id: str) -> Dict[str, Any]:
             "line_priority": "P2 HIGH",
         },
     )
-    return {"machine_id": clean_id, "assessed_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), **info}
+    out = {"machine_id": clean_id, "assessed_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), **info}
+    ctx = get_active_run_context()
+    if ctx is not None:
+        ctx.batch_risk_report = out
+    return out
 
 
 def create_purchase_requisition_impl(part_code: str, ticket_id: str) -> Dict[str, Any]:
@@ -1047,7 +1079,7 @@ def run_qa_line_clearance_impl(machine_id: str, ticket_id: str, final_vibration_
         {"check": f"10-Min Thermal & Vibration Run (<= {GMP_VIBRATION_LIMIT_RMS} mm/s)", "status": "PASS" if vib_ok else "FAIL"},
     ]
     approved = all(c["status"] == "PASS" for c in checks)
-    return {
+    out = {
         "ticket_id": ticket_id,
         "machine_id": clean_id,
         "final_vibration_rms": round(float(final_vibration_rms), 2),
@@ -1056,6 +1088,10 @@ def run_qa_line_clearance_impl(machine_id: str, ticket_id: str, final_vibration_
         "checklist": checks,
         "cleared_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
+    ctx = get_active_run_context()
+    if ctx is not None:
+        ctx.clearance_report = out
+    return out
 
 
 def create_capa_if_repeat_failure_impl(

@@ -26,7 +26,7 @@ from src.seed_data import (
     ensure_seed_data,
     reset_demo_environment,
 )
-from src.state import DEMO_SCENARIOS, MaintenanceState, create_initial_state
+from src.state import DEMO_SCENARIOS, MaintenanceState, create_custom_incident_state, create_initial_state
 from src.telemetry import SimulatedPlantTelemetryAdapter
 from src.tools import (
     build_incident_certificate_pdf,
@@ -591,6 +591,33 @@ def _render_hierarchy_orchestra_svg(
     )
 
 
+def _provenance_badge_html(source: str, lang: str = "en") -> str:
+    src = str(source or "OFFLINE_DEMO").upper()
+    if src == "LIVE_LLM":
+        return (
+            f'<span style="background:#1E3A8A;color:#BFDBFE;border:1px solid #3B82F6;'
+            f'border-radius:999px;padding:0.12rem 0.48rem;font-size:0.68rem;font-weight:800;">'
+            f'🧠 {html.escape(t(lang, "badge_live_llm"))}</span>'
+        )
+    if src == "LLM_GUARDRAILED":
+        return (
+            f'<span style="background:#78350F;color:#FDE68A;border:1px solid #F59E0B;'
+            f'border-radius:999px;padding:0.12rem 0.48rem;font-size:0.68rem;font-weight:800;">'
+            f'🛡️ {html.escape(t(lang, "badge_guardrailed"))}</span>'
+        )
+    if src == "HUMAN_QA":
+        return (
+            f'<span style="background:#713F12;color:#FEF08A;border:1px solid #EAB308;'
+            f'border-radius:999px;padding:0.12rem 0.48rem;font-size:0.68rem;font-weight:800;">'
+            f'👤 {html.escape(t(lang, "badge_human_qa"))}</span>'
+        )
+    return (
+        f'<span style="background:#1F2937;color:#CBD5E1;border:1px solid #475569;'
+        f'border-radius:999px;padding:0.12rem 0.48rem;font-size:0.68rem;font-weight:800;">'
+        f'🧪 {html.escape(t(lang, "badge_offline_demo"))}</span>'
+    )
+
+
 def _render_agent_traces_html(traces: List[Dict[str, Any]], lang: str = "en") -> str:
     if not traces:
         return (
@@ -615,6 +642,20 @@ def _render_agent_traces_html(traces: List[Dict[str, Any]], lang: str = "en") ->
 
         acts = tr.get("actions_taken") or []
         acts_str = " | ".join(html.escape(str(a)) for a in acts) if acts else "State inspection"
+        prov_badge = _provenance_badge_html(str(tr.get("decision_source", "OFFLINE_DEMO")), lang=lang)
+        raw_payload = tr.get("llm_raw_payload")
+        raw_details_html = ""
+        if raw_payload:
+            import json as _json
+
+            pretty_json = html.escape(_json.dumps(raw_payload, indent=2, ensure_ascii=False))
+            raw_details_html = (
+                f'<details style="margin-top:0.35rem;background:#0B1222;border:1px solid #1E293B;border-radius:6px;padding:0.3rem 0.55rem;">'
+                f'<summary style="cursor:pointer;font-size:0.74rem;color:#38BDF8;font-weight:700;">🔍 {html.escape(t(lang, "inspect_raw_llm"))}</summary>'
+                f'<pre style="margin:0.35rem 0 0 0;white-space:pre-wrap;word-break:break-word;font-size:0.72rem;color:#93C5FD;max-height:190px;overflow-y:auto;">{pretty_json}</pre>'
+                f'</details>'
+            )
+
         cards.append(
             _strip_html_indent(
                 f"""
@@ -624,13 +665,17 @@ def _render_agent_traces_html(traces: List[Dict[str, Any]], lang: str = "en") ->
                       <span class="trace-actor">{step_word} {step_num}: {html.escape(str(tr.get('agent_name', node)))}</span>
                       <span class="trace-tier"> &bull; {html.escape(str(tr.get('tier', '')))}</span>
                     </div>
-                    <span style="color:#64748B;font-size:0.71rem;"><code>{html.escape(str(tr.get('timestamp_utc', ''))[-9:])}</code></span>
+                    <div style="display:flex;align-items:center;gap:0.4rem;">
+                      {prov_badge}
+                      <span style="color:#64748B;font-size:0.71rem;"><code>{html.escape(str(tr.get('timestamp_utc', ''))[-9:])}</code></span>
+                    </div>
                   </div>
                   <div class="trace-line"><span class="trace-label">{html.escape(t(lang, 'trace_cmd'))}</span> {html.escape(str(tr.get('command_received', '')))}</div>
                   <div class="trace-line"><span class="trace-label">{html.escape(t(lang, 'trace_think'))}</span> {html.escape(str(tr.get('thinking', '')))}</div>
                   <div class="trace-line"><span class="trace-label">{html.escape(t(lang, 'trace_act'))}</span> <code>{acts_str}</code></div>
                   <div class="trace-line"><span class="trace-label">{html.escape(t(lang, 'trace_verdict'))}</span> {html.escape(str(tr.get('output_verdict', '')))}</div>
                   <div class="trace-line"><span class="trace-label">{html.escape(t(lang, 'trace_next'))}</span> <code>{html.escape(str(tr.get('delegated_to', '')))}</code></div>
+                  {raw_details_html}
                 </div>
                 """
             )
@@ -760,12 +805,28 @@ def _render_executive_closure_report(active_state: MaintenanceState, lang: str) 
         )
 
         # 4 High-Contrast HTML Executive KPI Cards
-        vib_main = f"{pre_rms:.1f} &rarr; {post_rms:.2f} mm/s" if post_rms > 0 else f"{pre_rms:.1f} mm/s (HELD)"
-        vib_sub = f"-{drop_pct:.0f}% {html.escape(t(lang, 'exec_reduction_lbl'))} (&le; {GMP_VIBRATION_LIMIT_RMS} GMP)" if post_rms > 0 else "Stopped by Human QA"
+        is_no_part = bool(diag_c.get("no_part_required") or part_code.upper() == "NONE")
+        if post_rms > 0:
+            vib_main = f"{pre_rms:.1f} &rarr; {post_rms:.2f} mm/s"
+            vib_sub = f"-{drop_pct:.0f}% {html.escape(t(lang, 'exec_reduction_lbl'))} (&le; {GMP_VIBRATION_LIMIT_RMS} GMP)"
+        elif is_no_part and gate_fin == "SIGNED_OFF":
+            vib_main = f"{pre_rms:.2f} mm/s (OK)"
+            vib_sub = f"No Part / Calibration (&le; {GMP_VIBRATION_LIMIT_RMS} GMP)"
+        else:
+            vib_main = f"{pre_rms:.1f} mm/s (HELD)"
+            vib_sub = "Stopped by Human QA"
         att_lbl = (
             ("Revizyon (2 Deneme)" if lang == "tr" else "Gate 3 Realign (2x)")
             if att_n > 1
-            else (("İlk Seferde Çözüm" if lang == "tr" else "First-Time-Fix") if att_n == 1 else ("Durduruldu" if lang == "tr" else "Work Held"))
+            else (
+                ("İlk Seferde Çözüm" if lang == "tr" else "First-Time-Fix")
+                if att_n == 1
+                else (
+                    ("Parça Değişimi Yok" if lang == "tr" else "Short Route (No Swap)")
+                    if (is_no_part and gate_fin == "SIGNED_OFF")
+                    else ("Durduruldu" if lang == "tr" else "Work Held")
+                )
+            )
         )
         part_sub_bits = []
         if inv_c.get("used_alternative"):
@@ -775,7 +836,7 @@ def _render_executive_closure_report(active_state: MaintenanceState, lang: str) 
         if capa_c.get("capa_triggered"):
             part_sub_bits.append(f"CAPA: {capa_c['capa_id']}")
         if not part_sub_bits:
-            part_sub_bits.append(f"Bin: {inv_c.get('bin_location', 'N/A')}")
+            part_sub_bits.append("No Hardware Swap" if is_no_part else f"Bin: {inv_c.get('bin_location', 'N/A')}")
 
         k1, k2, k3, k4 = st.columns(4)
         k1.markdown(
@@ -811,9 +872,9 @@ def _render_executive_closure_report(active_state: MaintenanceState, lang: str) 
         col_l, col_r = st.columns([1.06, 1.0])
         with col_l:
             st.markdown(f"##### 📊 {t(lang, 'exec_sec_vib')}")
-            x_lbls = ["Baseline", f"Alarm ({pre_rms:.1f})"]
+            x_lbls = ["Baseline", f"Reported ({pre_rms:.1f})" if is_no_part else f"Alarm ({pre_rms:.1f})"]
             y_vals = [1.20, pre_rms]
-            bar_cols = ["#38BDF8", "#EF4444"]
+            bar_cols = ["#38BDF8", "#10B981" if (is_no_part and pre_rms <= GMP_VIBRATION_LIMIT_RMS) else "#EF4444"]
             attempts_hist = list(maint_c.get("attempts_history") or active_state.get("maintenance_attempts") or [])
             for att in attempts_hist[:3]:
                 a_no = att.get("attempt_number", 1)
@@ -957,6 +1018,24 @@ def _render_executive_closure_report(active_state: MaintenanceState, lang: str) 
                 </div>
                 """
             ),
+            unsafe_allow_html=True,
+        )
+
+        # Executive Dynamic Route & Provenance Proof Strip
+        traces_all = list(active_state.get("agent_traces", []) or [])
+        route_nodes = [str(tr.get("node", "")) for tr in traces_all] + [f"FINISH ({gate_fin})"]
+        live_cnt = sum(1 for tr in traces_all if tr.get("decision_source") == "LIVE_LLM")
+        guard_cnt = sum(1 for tr in traces_all if tr.get("decision_source") == "LLM_GUARDRAILED")
+        human_cnt = sum(1 for tr in traces_all if tr.get("decision_source") == "HUMAN_QA")
+        off_cnt = sum(1 for tr in traces_all if tr.get("decision_source") in (None, "OFFLINE_DEMO"))
+        route_str = " &rarr; ".join(html.escape(n) for n in route_nodes)
+        st.markdown(
+            f'<div class="spotlight-box" style="margin-top:0.2rem;margin-bottom:0.55rem;padding:0.48rem 0.85rem;">'
+            f'<b>🧭 {html.escape(t(lang, "exec_route_proof_lbl"))}:</b> <code>{route_str}</code><br>'
+            f'<span style="font-size:0.78rem;color:#93C5FD;">'
+            f'Live LLM Steps: <b>{live_cnt}</b> &bull; GMP Safety Interlocks: <b>{guard_cnt}</b> &bull; '
+            f'Human QA Gates: <b>{human_cnt}</b> &bull; Offline Steps: <b>{off_cnt}</b>'
+            f'</span></div>',
             unsafe_allow_html=True,
         )
 
@@ -1516,6 +1595,37 @@ if active_view_idx == 0:
                     triggered_scenario = immediate_trip
                     trigger_src = "EDGE_SENSOR_TRIP_INJECTED"
 
+    with st.expander(t(lang, "custom_box_title"), expanded=False):
+        st.caption(t(lang, "custom_box_desc"))
+        cc1, cc2 = st.columns([1.0, 1.0])
+        with cc1:
+            custom_mid = st.selectbox(
+                t(lang, "custom_asset_lbl"),
+                options=["TP-01", "RP-04", "PK-02"],
+                index=0,
+                key="custom_asset_select",
+            )
+        with cc2:
+            custom_rms = st.number_input(
+                t(lang, "custom_rms_lbl"),
+                min_value=0.4,
+                max_value=14.0,
+                value=1.9,
+                step=0.1,
+                key="custom_rms_input",
+            )
+        custom_sym = st.text_area(
+            t(lang, "custom_symptom_lbl"),
+            value=t(lang, "custom_symptom_default"),
+            height=68,
+            key="custom_symptom_input",
+        )
+        custom_dispatch_clicked = st.button(
+            t(lang, "custom_dispatch_btn"),
+            width="stretch",
+            key="custom_incident_dispatch_btn",
+        )
+
     svg_placeholder = st.empty()
     spotlight_placeholder = st.empty()
 
@@ -1541,6 +1651,41 @@ if active_view_idx == 0:
             watch_pacing=watch_pacing,
         )
         st.rerun()
+    elif custom_dispatch_clicked:
+        if execution_mode == "live" and p_cfg["requires_key"] and (not resolved_key or mismatch_warn):
+            svg_placeholder.markdown(_render_hierarchy_orchestra_svg("standby", active_state, lang=lang), unsafe_allow_html=True)
+            st.error(
+                mismatch_warn
+                or t(lang, "key_missing_run_err", mid=custom_mid, prov=selected_provider.upper())
+            )
+        else:
+            init_custom = create_custom_incident_state(
+                machine_id=custom_mid,
+                alarm_vibration_rms=float(custom_rms),
+                symptom_summary=str(custom_sym),
+                execution_mode=execution_mode,
+                llm_provider=selected_provider,
+                llm_model=selected_model,
+                api_key=resolved_key,
+                pacing_delay_sec=pacing_delay,
+                hitl_enabled=hitl_enabled,
+                language=lang,
+            )
+            _render_top_banner(header_placeholder, init_custom, lang=lang, status_override="PENDING")
+            svg_placeholder.markdown(_render_hierarchy_orchestra_svg("orchestrator", init_custom, lang=lang), unsafe_allow_html=True)
+            active_state = _run_and_stream_into_placeholders(
+                state_to_run=init_custom,
+                selected_bay_scenarios=selected_bay_scenarios,
+                bay_placeholders=bay_placeholders,
+                svg_placeholder=svg_placeholder,
+                spotlight_placeholder=spotlight_placeholder,
+                traces_placeholder=traces_placeholder,
+                audit_placeholder=audit_placeholder,
+                header_placeholder=header_placeholder,
+                lang=lang,
+                watch_pacing=watch_pacing,
+            )
+            st.rerun()
     elif triggered_scenario:
         if execution_mode == "live" and p_cfg["requires_key"] and (not resolved_key or mismatch_warn):
             svg_placeholder.markdown(_render_hierarchy_orchestra_svg("standby", active_state, lang=lang), unsafe_allow_html=True)

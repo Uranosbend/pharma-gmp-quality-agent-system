@@ -244,6 +244,13 @@ def apply_human_decision(
             if decision == "APPROVED"
             else ("FINISH (İNSAN REDDİ)" if is_tr else "FINISH (HUMAN_REJECTED)")
         ),
+        "decision_source": "HUMAN_QA",
+        "llm_raw_payload": {
+            "approval_id": approval_id,
+            "decision": decision,
+            "reviewer": reviewer.strip() or "QA Lead",
+            "comment": comment.strip(),
+        },
     }
     updated["agent_traces"] = list(updated.get("agent_traces", [])) + [human_trace]
 

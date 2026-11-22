@@ -338,9 +338,11 @@ class TestQualityAgentPipeline(unittest.TestCase):
             )
 
     def test_09_autonomous_orchestra_interlocks_and_mocked_live_404_fallback(self) -> None:
+        from src.state import create_custom_incident_state
+
         self.assertIsNotNone(build_maintenance_graph())
 
-        # Verify _enforce_orchestra_interlocks fixes wrong LLM reviewed_stage for HITL REPAIR_COST safety
+        # 1. Stage-flag normalization preserves valid autonomous next_agent without overriding
         st_check = create_initial_state("scenario_1", execution_mode="live", hitl_enabled=True)
         st_check["diagnostic_done"] = True
         st_check["precheck_done"] = True
@@ -355,8 +357,64 @@ class TestQualityAgentPipeline(unittest.TestCase):
             audit_notes="bad stage",
         )
         enforced = _enforce_orchestra_interlocks(wrong_llm, st_check)
+        self.assertEqual(enforced.next_agent, "field_technician")
         self.assertEqual(enforced.reviewed_stage, "stock")
         self.assertEqual(enforced.gate_decision, "APPROVED")
+
+        # 2. Invariant-only guardrail MUST allow dynamic non-linear short-circuit (diagnostic_engineer -> analyst_capa on NONE part)
+        st_custom = create_custom_incident_state(
+            "TP-01",
+            1.8,
+            "Sensor cable SNS-9010 glitch check",
+            execution_mode="live",
+            hitl_enabled=False,
+        )
+        dyn_pick = OrchestratorDecision(
+            next_agent="diagnostic_engineer",
+            instruction="Verify telemetry and SOP only",
+            gate_decision="PENDING",
+            reviewed_stage="intake",
+            audit_notes="RMS below 2.5; inspect sensor directly.",
+        )
+        dyn_out = _enforce_orchestra_interlocks(dyn_pick, st_custom)
+        self.assertEqual(dyn_out.next_agent, "diagnostic_engineer")  # NOT forced to parallel_intake!
+
+        # 3. Hard GMP safety invariant MUST veto unsafe SIGNED_OFF while RMS > 2.5 mm/s
+        st_unsafe = create_initial_state("scenario_2", execution_mode="live", hitl_enabled=False)
+        st_unsafe["diagnostic_done"] = True
+        st_unsafe["diagnostic_report"] = {"sop_code": "SOP-MNT-002", "page_number": 2, "root_cause": "cavitation", "required_part_code": "SL-8810"}
+        st_unsafe["inventory_report"] = {"reserved": True, "reserved_part_code": "SL-8810"}
+        st_unsafe["maintenance_report"] = {"post_repair_vibration_rms": 4.8}
+        unsafe_close = OrchestratorDecision(
+            next_agent="FINISH",
+            instruction="Close now",
+            gate_decision="SIGNED_OFF",
+            reviewed_stage="closure",
+            audit_notes="LLM hallucinated premature sign-off",
+        )
+        vetoed = _enforce_orchestra_interlocks(unsafe_close, st_unsafe)
+        self.assertEqual(vetoed.next_agent, "diagnostic_engineer")
+        self.assertEqual(vetoed.gate_decision, "REJECTED")
+
+        # 4. Anti-Loop invariant: repeating analyst_capa after logged_to_db closes as FINISH / SIGNED_OFF
+        from src.llm_config import is_daily_quota_exhausted_error, is_rate_limit_error
+
+        st_done_an = create_custom_incident_state("TP-01", 1.8, "Sensor glitch", execution_mode="live", hitl_enabled=False)
+        st_done_an["diagnostic_done"] = True
+        st_done_an["diagnostic_report"] = {"sop_code": "SOP-MNT-001", "page_number": 6, "root_cause": "cable", "required_part_code": "NONE", "no_part_required": True}
+        st_done_an["analytics_report"] = {"logged_to_db": True, "excel_report_path": "out.xlsx"}
+        repeat_an = OrchestratorDecision(
+            next_agent="analyst_capa",
+            instruction="Run analyst again",
+            gate_decision="APPROVED",
+            reviewed_stage="diagnostic",
+            audit_notes="loop",
+        )
+        closed_out = _enforce_orchestra_interlocks(repeat_an, st_done_an)
+        self.assertEqual(closed_out.next_agent, "FINISH")
+        self.assertEqual(closed_out.gate_decision, "SIGNED_OFF")
+        self.assertTrue(is_rate_limit_error(RuntimeError("Error code: 429 - rate_limit_exceeded")))
+        self.assertTrue(is_daily_quota_exhausted_error(RuntimeError("Rate limit reached on tokens per day (TPD)")))
 
         init_live = create_initial_state(
             "scenario_1",
@@ -444,7 +502,7 @@ class TestQualityAgentPipeline(unittest.TestCase):
                                     {"id": "11", "name": "generate_monthly_excel_report", "args": {}},
                                 ],
                             )
-                    return AIMessage(content='{"sop_code": "SOP-MNT-001", "page_number": 2, "required_part_code": "BRG-4402"}')
+                    return AIMessage(content='{"sop_code": "SOP-MNT-001", "page_number": 2, "required_part_code": "BRG-4402", "reasoning": "Live mocked reasoning verified via tools."}')
 
                 b_llm.invoke.side_effect = call_t
                 return b_llm
@@ -461,6 +519,10 @@ class TestQualityAgentPipeline(unittest.TestCase):
         self.assertEqual(fin_live["llm_model"], "llama-3.1-8b-instant")
         self.assertEqual(fin_live["last_gate_decision"], "SIGNED_OFF")
         self.assertGreaterEqual(len(get_audit_log_dataframe(init_live["ticket_id"])), 11)
+        # Verify real LIVE_LLM provenance + raw payload recorded across Orchestrator & workers
+        live_traces = [tr for tr in fin_live["agent_traces"] if tr.get("decision_source") == "LIVE_LLM"]
+        self.assertGreaterEqual(len(live_traces), 8)
+        self.assertTrue(any(tr.get("llm_raw_payload") for tr in live_traces))
 
     def test_10_bilingual_tr_en_localization_and_streamlit_ui_smoke(self) -> None:
         # Bilingual i18n unit assertions
@@ -521,6 +583,43 @@ class TestQualityAgentPipeline(unittest.TestCase):
         self.assertFalse(at.exception)
         at.button(key="nav_btn_2").click().run()
         self.assertFalse(at.exception)
+
+    def test_11_custom_unseen_incident_dynamic_short_route_and_ui(self) -> None:
+        from streamlit.testing.v1 import AppTest
+        from src.state import create_custom_incident_state
+
+        init_custom = create_custom_incident_state(
+            machine_id="TP-01",
+            alarm_vibration_rms=1.9,
+            symptom_summary="Intermittent accelerometer cable SNS-9010 signal glitch; 44 C housing, no mechanical grinding.",
+            execution_mode="offline_demo",
+            hitl_enabled=False,
+            language="en",
+        )
+        fin_custom, _ = run_maintenance_workflow(init_custom)
+        self.assertTrue(fin_custom["protocol_closed"])
+        self.assertEqual(fin_custom["last_gate_decision"], "SIGNED_OFF")
+        visited_nodes = {tr["node"] for tr in fin_custom["agent_traces"]}
+        self.assertIn("diagnostic_engineer", visited_nodes)
+        self.assertIn("analyst_capa", visited_nodes)
+        # Dynamic short route MUST bypass warehouse SQL mutation and shop-floor hardware swap
+        self.assertNotIn("stock_agent", visited_nodes)
+        self.assertNotIn("field_technician", visited_nodes)
+        self.assertEqual(fin_custom["analytics_report"]["part_cost_usd"], 0.0)
+        self.assertEqual(fin_custom["analytics_report"]["repair_attempts"], 0)
+
+        # Exercise Custom Unseen Incident challenge directly in Streamlit UI
+        at = AppTest.from_file(str(ROOT_DIR / "app.py"), default_timeout=30)
+        at.run()
+        at.sidebar.radio(key="exec_mode_radio").set_value("offline_demo")
+        at.sidebar.slider(key="watch_pacing_slider").set_value(0.0)
+        at.toggle(key="auto_anomaly_toggle").set_value(False).run()
+        at.button(key="custom_incident_dispatch_btn").click().run()
+        self.assertFalse(at.exception, f"Custom incident UI dispatch raised: {at.exception}")
+        ui_state = at.session_state["last_state"]
+        self.assertTrue(ui_state["protocol_closed"])
+        self.assertEqual(ui_state["scenario_id"], "custom_unseen")
+        self.assertNotIn("field_technician", {tr["node"] for tr in ui_state["agent_traces"]})
 
 
 if __name__ == "__main__":

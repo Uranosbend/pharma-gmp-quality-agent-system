@@ -197,6 +197,29 @@ def fetch_live_models(provider: str, api_key: Optional[str] = None) -> Tuple[Lis
     return fallback, None
 
 
+def is_rate_limit_error(exc: Exception) -> bool:
+    """Detect HTTP 429 / TPM / TPD rate limit errors."""
+    msg = f"{type(exc).__name__}: {exc}".lower()
+    markers = (
+        "429",
+        "rate_limit",
+        "rate limit",
+        "tokens per minute",
+        "tokens per day",
+        "(tpd)",
+        "(tpm)",
+        "quota",
+        "too many requests",
+    )
+    return any(m in msg for m in markers)
+
+
+def is_daily_quota_exhausted_error(exc: Exception) -> bool:
+    """Detect exhausted daily token bucket (TPD) where retrying the same model is futile."""
+    msg = f"{type(exc).__name__}: {exc}".lower()
+    return any(m in msg for m in ("tokens per day", "(tpd)", "daily limit"))
+
+
 def is_model_not_found_error(exc: Exception) -> bool:
     """Detect HTTP 404 / model_not_found / unsupported model errors."""
     msg = f"{type(exc).__name__}: {exc}".lower()
@@ -220,10 +243,24 @@ def resolve_fallback_model(
     api_key: Optional[str] = None,
     tried_models: Optional[List[str]] = None,
 ) -> Optional[str]:
-    """Find an accessible fallback model when the selected model returns 404."""
+    """Find an accessible fallback model when the selected model returns 404 or 429."""
     excluded = {failed_model} | set(tried_models or [])
     live_models, _ = fetch_live_models(provider, api_key)
-    for m in live_models:
+    if provider == "groq" and live_models:
+        preferred = (
+            "openai/gpt-oss-20b",
+            "llama-3.1-8b-instant",
+            "qwen/qwen3-32b",
+            "qwen/qwen3.8-27b",
+            "openai/gpt-oss-120b",
+            "llama-3.3-70b-versatile",
+        )
+        live_set = set(live_models)
+        ordered = [m for m in preferred if m in live_set] + [m for m in live_models if m not in preferred]
+    else:
+        ordered = live_models
+
+    for m in ordered:
         if m not in excluded:
             return m
     for m in PROVIDER_CATALOG.get(provider, {}).get("models", []):
@@ -253,6 +290,7 @@ def get_chat_model(
             api_key=resolved_key,
             temperature=temperature,
             max_retries=0,
+            timeout=25,
         )
 
     if provider == "gemini":
@@ -310,11 +348,11 @@ def invoke_with_retry(
     callable_fn: Callable[..., Any],
     *args: Any,
     pacing_delay: float = 0.3,
-    max_retries: int = 5,
-    base_delay: float = 2.0,
+    max_retries: int = 2,
+    base_delay: float = 1.2,
     **kwargs: Any,
 ) -> Any:
-    """Execute an LLM call with configurable pacing and exponential backoff on 429s."""
+    """Execute an LLM call with configurable pacing and fast exponential backoff on 429s."""
     if pacing_delay > 0:
         time.sleep(pacing_delay)
 
@@ -324,9 +362,9 @@ def invoke_with_retry(
             return callable_fn(*args, **kwargs)
         except Exception as exc:
             last_exc = exc
-            if attempt >= max_retries or not _is_transient_rate_or_network_error(exc):
+            if is_daily_quota_exhausted_error(exc) or attempt >= max_retries or not _is_transient_rate_or_network_error(exc):
                 raise
-            sleep_sec = min(base_delay * (2**attempt) + random.uniform(0.1, 0.75), 20.0)
+            sleep_sec = min(base_delay * (2**attempt) + random.uniform(0.1, 0.5), 4.0)
             time.sleep(sleep_sec)
 
     assert last_exc is not None
@@ -363,7 +401,26 @@ def invoke_structured_decision(
     except Exception as first_err:
         if _is_transient_rate_or_network_error(first_err) or is_model_not_found_error(first_err):
             raise
-        raw_msg = invoke_with_retry(llm.invoke, messages, pacing_delay=pacing_delay)
+        from langchain_core.messages import HumanMessage
+
+        fields_list = ", ".join(getattr(schema_cls, "model_fields", {}).keys())
+        json_guard = HumanMessage(
+            content=(
+                f"Respond strictly with ONE valid JSON object (no markdown, no prose) containing keys: {fields_list}. "
+                "Every string field must be a plain string (not a list)."
+            )
+        )
+        try:
+            json_llm = llm.with_structured_output(schema_cls, method="json_mode")
+            res2 = invoke_with_retry(json_llm.invoke, list(messages) + [json_guard], pacing_delay=pacing_delay)
+            if isinstance(res2, schema_cls):
+                return res2
+            if isinstance(res2, dict):
+                return schema_cls.model_validate(res2)
+        except Exception as second_err:
+            if _is_transient_rate_or_network_error(second_err) or is_model_not_found_error(second_err):
+                raise
+        raw_msg = invoke_with_retry(llm.invoke, list(messages) + [json_guard], pacing_delay=pacing_delay)
         content = getattr(raw_msg, "content", str(raw_msg))
         if isinstance(content, list):
             content = " ".join(

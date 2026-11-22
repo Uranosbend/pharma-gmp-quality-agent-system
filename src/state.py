@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from typing import Annotated, Any, Dict, List, Literal, Optional
 from typing_extensions import TypedDict
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 def _merge_append_unique(
@@ -64,6 +64,104 @@ class OrchestratorDecision(BaseModel):
         "closure",
     ] = Field(..., description="Stage of the eBMR protocol evaluated at this step.")
     audit_notes: str = Field(..., description="Traceable ALCOA+ justification citing state evidence.")
+
+    @field_validator("instruction", "audit_notes", mode="before")
+    @classmethod
+    def _coerce_text_fields(cls, v: Any) -> str:
+        if v is None:
+            return ""
+        if isinstance(v, (list, tuple)):
+            return " ".join(str(x).strip() for x in v if str(x).strip())
+        if isinstance(v, dict):
+            return "; ".join(f"{k}: {val}" for k, val in v.items())
+        return str(v)
+
+    @field_validator("next_agent", mode="before")
+    @classmethod
+    def _normalize_next_agent(cls, v: Any) -> str:
+        raw = str(v or "").strip()
+        low = raw.lower()
+        aliases = {
+            "parallel": "parallel_intake",
+            "parallel_intake_check": "parallel_intake",
+            "intake": "parallel_intake",
+            "diagnostic": "diagnostic_engineer",
+            "reliability_engineer": "diagnostic_engineer",
+            "engineer": "diagnostic_engineer",
+            "stock": "stock_agent",
+            "inventory": "stock_agent",
+            "inventory_agent": "stock_agent",
+            "technician": "field_technician",
+            "maintenance": "field_technician",
+            "maintenance_agent": "field_technician",
+            "clearance": "qa_clearance",
+            "qa": "qa_clearance",
+            "analyst": "analyst_capa",
+            "capa": "analyst_capa",
+            "analytics": "analyst_capa",
+            "finish": "FINISH",
+            "end": "FINISH",
+            "close": "FINISH",
+            "done": "FINISH",
+        }
+        return aliases.get(low, raw)
+
+    @field_validator("gate_decision", mode="before")
+    @classmethod
+    def _normalize_gate_decision(cls, v: Any) -> str:
+        raw = str(v or "PENDING").strip().upper()
+        aliases = {
+            "REQUIRED": "PENDING",
+            "INITIAL": "PENDING",
+            "IN_PROGRESS": "PENDING",
+            "DISPATCH": "PENDING",
+            "DISPATCHED": "PENDING",
+            "OPEN": "PENDING",
+            "APPROVE": "APPROVED",
+            "PASS": "APPROVED",
+            "PASSED": "APPROVED",
+            "OK": "APPROVED",
+            "REJECT": "REJECTED",
+            "FAIL": "REJECTED",
+            "FAILED": "REJECTED",
+            "DENIED": "REJECTED",
+            "ESCALATE": "ESCALATED",
+            "HUMAN": "AWAITING_HUMAN",
+            "PAUSE": "AWAITING_HUMAN",
+            "WAIT": "AWAITING_HUMAN",
+            "WAITING": "AWAITING_HUMAN",
+            "CLOSE": "SIGNED_OFF",
+            "CLOSED": "SIGNED_OFF",
+            "COMPLETE": "SIGNED_OFF",
+            "COMPLETED": "SIGNED_OFF",
+            "SIGN_OFF": "SIGNED_OFF",
+            "DONE": "SIGNED_OFF",
+        }
+        return aliases.get(raw, raw)
+
+    @field_validator("reviewed_stage", mode="before")
+    @classmethod
+    def _normalize_reviewed_stage(cls, v: Any) -> str:
+        raw = str(v or "intake").strip().lower()
+        aliases = {
+            "parallel_intake": "intake",
+            "diagnostics": "diagnostic",
+            "inventory": "stock",
+            "repair": "maintenance",
+            "rework": "maintenance",
+            "replan": "engineering_replan",
+            "escalation": "engineering_replan",
+            "line_clearance": "clearance",
+            "qa": "clearance",
+            "analytics": "analyst",
+            "kpi": "analyst",
+            "capa": "analyst",
+            "close": "closure",
+            "final": "closure",
+            "signoff": "closure",
+            "finish": "closure",
+        }
+        return aliases.get(raw, raw)
 
 
 class MaintenanceState(TypedDict):
@@ -462,9 +560,9 @@ DEMO_SCENARIOS: Dict[str, Dict[str, Any]] = {
 }
 
 _BAY_META = {
-    "TP-01": {"area": "Compression Suite A", "baseline_rms": 1.12, "nominal_rpm": 45, "downtime_rate_per_min": 68.0},
-    "RP-04": {"area": "WFI & Granulation Suite B", "baseline_rms": 1.28, "nominal_rpm": 1450, "downtime_rate_per_min": 52.0},
-    "PK-02": {"area": "Primary Packaging Suite C", "baseline_rms": 1.18, "nominal_rpm": 120, "downtime_rate_per_min": 44.0},
+    "TP-01": {"area": "Compression Suite A", "machine_name": "TP-01 Rotary Tablet Press (Fette-Class)", "baseline_rms": 1.12, "nominal_rpm": 45, "downtime_rate_per_min": 68.0},
+    "RP-04": {"area": "WFI & Granulation Suite B", "machine_name": "RP-04 Sanitary Centrifugal Pump (3-A)", "baseline_rms": 1.28, "nominal_rpm": 1450, "downtime_rate_per_min": 52.0},
+    "PK-02": {"area": "Primary Packaging Suite C", "machine_name": "PK-02 Servo Blister Packaging Line", "baseline_rms": 1.18, "nominal_rpm": 120, "downtime_rate_per_min": 44.0},
 }
 for _sc in DEMO_SCENARIOS.values():
     _bm = _BAY_META[_sc["machine_id"]]
@@ -474,6 +572,92 @@ for _sc in DEMO_SCENARIOS.values():
     _sc.setdefault("downtime_rate_per_min", _bm["downtime_rate_per_min"])
     _sc.setdefault("alarm_vibration_rms", _sc["initial_vibration_rms"])
     _sc.setdefault("button_label", f"⚡ Inject Fault on {_sc['machine_id']}")
+
+
+def create_custom_incident_state(
+    machine_id: str,
+    alarm_vibration_rms: float,
+    symptom_summary: str,
+    alarm_type: str = "Custom Unseen Plant Anomaly",
+    execution_mode: str = "live",
+    llm_provider: str = "groq",
+    llm_model: str = "openai/gpt-oss-120b",
+    api_key: Optional[str] = None,
+    pacing_delay_sec: float = 0.3,
+    hitl_enabled: bool = True,
+    language: str = "en",
+) -> MaintenanceState:
+    """Create initial MaintenanceState for an unseen free-text plant anomaly (not in DEMO_SCENARIOS)."""
+    clean_mid = machine_id.strip().upper()
+    if clean_mid not in _BAY_META:
+        clean_mid = "TP-01"
+    bm = _BAY_META[clean_mid]
+    rms_val = float(alarm_vibration_rms)
+    ticket_id = f"TKT-{uuid.uuid4().hex[:8].upper()}"
+    clean_symptom = (symptom_summary or "").strip() or (
+        f"Live operator anomaly reported on {clean_mid} at {rms_val:.2f} mm/s RMS."
+    )
+
+    return {
+        "ticket_id": ticket_id,
+        "scenario_id": "custom_unseen",
+        "machine_id": clean_mid,
+        "machine_name": bm["machine_name"],
+        "trigger_source": "LIVE_CUSTOM_INCIDENT",
+        "alarm_type": alarm_type,
+        "alarm_vibration_rms": rms_val,
+        "symptom_summary": clean_symptom,
+        "inject_post_repair_fail": False,
+        "execution_mode": execution_mode,
+        "llm_provider": llm_provider,
+        "llm_model": llm_model,
+        "api_key": api_key,
+        "pacing_delay_sec": float(pacing_delay_sec),
+        "hitl_enabled": bool(hitl_enabled),
+        "language": "tr" if str(language).lower() == "tr" else "en",
+        "next_agent": "diagnostic_engineer" if rms_val <= 2.5 else "parallel_intake",
+        "current_instruction": (
+            f"Evaluate unseen custom anomaly on {clean_mid} ({rms_val:.2f} mm/s RMS): {clean_symptom}"
+        ),
+        "last_worker": "orchestrator",
+        "last_gate_decision": "PENDING",
+        "iteration_count": 0,
+        "max_iterations": 22,
+        "diagnostic_done": False,
+        "precheck_done": False,
+        "diagnostic_approved": False,
+        "stock_approved": False,
+        "escalation_to_engineer": False,
+        "engineering_replan_done": False,
+        "maintenance_approved": False,
+        "clearance_approved": False,
+        "analyst_approved": False,
+        "protocol_closed": False,
+        "escalated": False,
+        "awaiting_human_approval": False,
+        "pending_approval": {},
+        "human_decisions": {},
+        "vibration_test_count": 0,
+        "repair_attempt_count": 0,
+        "error_message": "",
+        "diagnostic_report": {},
+        "precheck_report": {},
+        "inventory_report": {},
+        "purchase_requisition": {},
+        "engineering_replan": {},
+        "maintenance_report": {},
+        "clearance_report": {},
+        "capa_report": {},
+        "analytics_report": {},
+        "rag_chunks": [],
+        "sql_queries": [],
+        "telemetry_readings": [],
+        "maintenance_attempts": [],
+        "tool_calls_log": [],
+        "audit_trail": [],
+        "agent_events": [],
+        "agent_traces": [],
+    }
 
 
 def create_initial_state(

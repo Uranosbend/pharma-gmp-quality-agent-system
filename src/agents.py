@@ -16,6 +16,7 @@ from src.llm_config import (
     invoke_structured_decision,
     invoke_with_retry,
     is_model_not_found_error,
+    is_rate_limit_error,
     resolve_fallback_model,
 )
 from src.seed_data import GMP_VIBRATION_LIMIT_RMS
@@ -96,8 +97,10 @@ def _make_trace(
     delegated_to: str,
     timestamp_utc: Optional[str] = None,
     lang: str = "en",
+    decision_source: str = "OFFLINE_DEMO",
+    llm_raw_payload: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Build structured watcher trace capturing incoming command, reasoning, actions, and handoff."""
+    """Build structured watcher trace capturing provenance, incoming command, reasoning, actions, and handoff."""
     out_tier, out_name = (
         _TR_AGENT_NAMES.get(agent_name, (tier, agent_name))
         if str(lang).lower() == "tr"
@@ -113,6 +116,8 @@ def _make_trace(
         "actions_taken": list(actions_taken),
         "output_verdict": output_verdict,
         "delegated_to": delegated_to,
+        "decision_source": decision_source,
+        "llm_raw_payload": llm_raw_payload,
     }
 
 
@@ -139,7 +144,32 @@ def _run_specialist_tool_loop(
     executed_tools: List[Dict[str, Any]] = []
 
     for _ in range(max_rounds):
-        ai_msg = invoke_with_retry(llm_with_tools.invoke, messages, pacing_delay=pacing_delay)
+        try:
+            ai_msg = invoke_with_retry(llm_with_tools.invoke, messages, pacing_delay=pacing_delay)
+        except Exception as tool_exc:
+            low_err = str(tool_exc).lower()
+            if any(
+                m in low_err
+                for m in (
+                    "tool_use_failed",
+                    "tool call validation failed",
+                    "not in request.tools",
+                    "did not match schema",
+                )
+            ):
+                allowed = ", ".join(t.name for t in tools)
+                messages.append(
+                    HumanMessage(
+                        content=(
+                            f"Correction: your previous tool call was rejected ({str(tool_exc)[:220]}). "
+                            f"Use ONLY exact tool names [{allowed}] and exact schema parameters "
+                            "(e.g. for log_incident_analytics pass a JSON string under parameter name 'ticket_data'), "
+                            "or respond now with your final JSON summary."
+                        )
+                    )
+                )
+                continue
+            raise
         messages.append(ai_msg)
 
         tool_calls = getattr(ai_msg, "tool_calls", None) or []
@@ -200,29 +230,30 @@ def _invoke_live_with_model_fallback(
     state: MaintenanceState,
     call_fn: Callable[[str], Any],
 ) -> Tuple[Any, str, Optional[str]]:
-    """Invoke a live LLM action with automatic 404 model_not_found recovery."""
+    """Invoke a live LLM action with automatic 404 model_not_found & 429 rate-limit recovery."""
     provider = state["llm_provider"]
     current_model = state["llm_model"]
     api_key = state.get("api_key")
     tried: List[str] = []
 
-    for attempt in range(3):
+    for attempt in range(4):
         try:
             result = call_fn(current_model)
             note = (
-                f"Auto-switched model from '{state['llm_model']}' to accessible '{current_model}' after 404."
+                f"Auto-switched model from '{state['llm_model']}' to accessible '{current_model}' after 404/429."
                 if current_model != state["llm_model"]
                 else None
             )
             return result, current_model, note
         except Exception as exc:
             tried.append(current_model)
-            if not is_model_not_found_error(exc) or attempt >= 2:
-                if is_model_not_found_error(exc):
+            recoverable = is_model_not_found_error(exc) or is_rate_limit_error(exc)
+            if not recoverable or attempt >= 3:
+                if recoverable:
                     avail, _ = fetch_live_models(provider, api_key)
                     preview = ", ".join(avail[:5]) if avail else "none discovered"
                     raise RuntimeError(
-                        f"Model '{current_model}' not found/accessible on {provider}. "
+                        f"Model '{current_model}' unavailable or rate-limited on {provider}. "
                         f"Available models detected: [{preview}]. Original error: {exc}"
                     ) from exc
                 raise
@@ -239,8 +270,26 @@ def _invoke_live_with_model_fallback(
 # ---------------------------------------------------------------------------
 
 
+def _is_no_part_case(state: MaintenanceState) -> bool:
+    """Return True when the Diagnostic Engineer verified no physical spare replacement is needed."""
+    diag = state.get("diagnostic_report", {}) or {}
+    if diag.get("no_part_required"):
+        return True
+    req_p = str(diag.get("required_part_code") or "").strip().upper()
+    if req_p in ("NONE", "N/A", "CALIBRATION_ONLY", "NO_PART"):
+        return True
+    if (
+        state.get("scenario_id") == "custom_unseen"
+        and float(state.get("alarm_vibration_rms", 0.0) or 0.0) <= GMP_VIBRATION_LIMIT_RMS
+        and state.get("diagnostic_done")
+        and not req_p
+    ):
+        return True
+    return False
+
+
 def _evaluate_orchestra_state(state: MaintenanceState) -> OrchestratorDecision:
-    """Deterministic GMP-QA-010 quality gate & 3-tier hierarchy state machine."""
+    """Deterministic fallback state machine used strictly in Offline Safe Demo Mode or error halts."""
     if state.get("error_message"):
         return OrchestratorDecision(
             next_agent="FINISH",
@@ -256,9 +305,26 @@ def _evaluate_orchestra_state(state: MaintenanceState) -> OrchestratorDecision:
     clear = state.get("clearance_report", {})
     analyt = state.get("analytics_report", {})
     human_decisions = state.get("human_decisions", {})
+    no_part = _is_no_part_case(state)
+    is_custom_low = (
+        state.get("scenario_id") == "custom_unseen"
+        and float(state.get("alarm_vibration_rms", 0.0) or 0.0) <= GMP_VIBRATION_LIMIT_RMS
+    )
 
-    # Phase 0: Edge Alarm -> Parallel Fan-Out (Diagnostic Engineer + Batch/Stock Pre-Check)
-    if not state.get("diagnostic_done") or not state.get("precheck_done"):
+    # Phase 0: Edge Alarm -> Diagnostic-Only (low-RMS unseen) or Parallel Intake
+    if is_custom_low and not state.get("diagnostic_done"):
+        return OrchestratorDecision(
+            next_agent="diagnostic_engineer",
+            instruction=(
+                f"Low-RMS anomaly reported on {state['machine_id']} ({state['alarm_vibration_rms']} mm/s <= {GMP_VIBRATION_LIMIT_RMS}). "
+                "Inspect telemetry & SOPs directly; determine whether a physical part swap is even needed."
+            ),
+            gate_decision="PENDING",
+            reviewed_stage="intake",
+            audit_notes=f"Dynamic route: RMS {state['alarm_vibration_rms']} <= {GMP_VIBRATION_LIMIT_RMS} mm/s; skipping pre-quarantine and checking Diagnostic Engineer first.",
+        )
+
+    if not is_custom_low and (not state.get("diagnostic_done") or not state.get("precheck_done")):
         return OrchestratorDecision(
             next_agent="parallel_intake",
             instruction=(
@@ -273,9 +339,36 @@ def _evaluate_orchestra_state(state: MaintenanceState) -> OrchestratorDecision:
             ),
         )
 
+    # Dynamic short-circuit when diagnostics proved no spare part replacement is needed
+    if no_part and state.get("diagnostic_done"):
+        has_sop = bool(diag.get("sop_code")) and bool(diag.get("root_cause"))
+        if not has_sop:
+            return OrchestratorDecision(
+                next_agent="diagnostic_engineer",
+                instruction="REJECTED: Diagnostic Report missing valid SOP citation or root cause. Re-run RAG.",
+                gate_decision="REJECTED",
+                reviewed_stage="diagnostic",
+                audit_notes="Gate 1 REJECTED: Incomplete SOP citation or root cause.",
+            )
+        if not analyt.get("logged_to_db"):
+            return OrchestratorDecision(
+                next_agent="analyst_capa",
+                instruction="No spare part replacement required (sensor/calibration inspection only). Skip Stock/Field Repair and log KPI analytics.",
+                gate_decision="APPROVED",
+                reviewed_stage="diagnostic",
+                audit_notes=f"Gate 1 APPROVED ({diag.get('sop_code')} p.{diag.get('page_number', 1)}): Non-mechanical / calibration-only outcome; dynamically bypassing Stock & Field Maintenance.",
+            )
+        return OrchestratorDecision(
+            next_agent="FINISH",
+            instruction="Non-mechanical anomaly verified, logged & archived. Close eBMR cleanly.",
+            gate_decision="SIGNED_OFF",
+            reviewed_stage="closure",
+            audit_notes=f"Protocol SIGNED_OFF (Dynamic Short Route): Analytics logged (Downtime {analyt.get('downtime_minutes')}m, Cost ${analyt.get('total_cost_usd', 0):,.2f}).",
+        )
+
     # Phase 1: Gate 1 Verification -> Stock & Auto-Procurement Agent
     if not state.get("diagnostic_approved"):
-        has_sop = bool(diag.get("sop_code")) and bool(diag.get("page_number"))
+        has_sop = bool(diag.get("sop_code")) and bool(diag.get("root_cause"))
         has_root = bool(diag.get("root_cause")) and bool(diag.get("required_part_code"))
         if not (has_sop and has_root):
             return OrchestratorDecision(
@@ -378,7 +471,6 @@ def _evaluate_orchestra_state(state: MaintenanceState) -> OrchestratorDecision:
 
         rms = maint.get("post_repair_vibration_rms")
         if rms is None or float(rms) > GMP_VIBRATION_LIMIT_RMS:
-            # Upward escalation: Technician -> Reliability Engineer -> Rework Auth -> Technician Attempt #2
             if not state.get("engineering_replan_done"):
                 return OrchestratorDecision(
                     next_agent="diagnostic_engineer",
@@ -472,27 +564,288 @@ def _evaluate_orchestra_state(state: MaintenanceState) -> OrchestratorDecision:
     )
 
 
+def _validate_gmp_invariants(
+    llm_decision: OrchestratorDecision, state: MaintenanceState
+) -> Tuple[OrchestratorDecision, Optional[str]]:
+    """Neuro-Symbolic Safety Guardrails: preserve autonomous LLM routes unless a hard GMP safety law is violated."""
+    if state.get("error_message"):
+        return (
+            OrchestratorDecision(
+                next_agent="FINISH",
+                instruction="Workflow terminated due to execution error.",
+                gate_decision="ESCALATED",
+                reviewed_stage="closure",
+                audit_notes=str(state["error_message"]),
+            ),
+            "Execution error halt.",
+        )
+
+    diag = state.get("diagnostic_report", {}) or {}
+    inv = state.get("inventory_report", {}) or {}
+    maint = state.get("maintenance_report", {}) or {}
+    analyt = state.get("analytics_report", {}) or {}
+    hdec = state.get("human_decisions", {}) or {}
+    no_part = _is_no_part_case(state)
+    alarm_rms = float(state.get("alarm_vibration_rms", 0.0) or 0.0)
+
+    # Safety Law 5A: Enforce pending Human-in-the-Loop SQL gate
+    if inv.get("awaiting_sql_approval") and hdec.get("sql_reservation", {}).get("decision") != "APPROVED":
+        return (
+            OrchestratorDecision(
+                next_agent="FINISH",
+                instruction="Awaiting Human QA Supervisor permission for SQLite stock update.",
+                gate_decision="AWAITING_HUMAN",
+                reviewed_stage="stock",
+                audit_notes=f"Paused at HITL Gate (SQL_MUTATION) for {inv.get('proposed_part_code')}.",
+            ),
+            "HITL Safety Invariant: SQLite write requires Human QA authorization." if llm_decision.next_agent != "FINISH" else None,
+        )
+
+    # Safety Law 5B: Prevent technician dispatch on complete zero-stockout
+    if inv.get("escalate_procurement") and llm_decision.next_agent == "field_technician":
+        return (
+            OrchestratorDecision(
+                next_agent="FINISH",
+                instruction="ESCALATED: Zero stock for OEM and compatible alternative spare parts.",
+                gate_decision="ESCALATED",
+                reviewed_stage="stock",
+                audit_notes="GMP Material Invariant: Zero stock for OEM and compatible alternative.",
+            ),
+            "GMP Material Invariant: Cannot dispatch technician with zero inventory.",
+        )
+
+    # Safety Law 4: Upward Tier 1 -> Tier 2 escalation on > 2.5 mm/s post-repair failure
+    if maint and maint.get("post_repair_vibration_rms") is not None:
+        post_rms = float(maint["post_repair_vibration_rms"])
+        if post_rms > GMP_VIBRATION_LIMIT_RMS and not state.get("engineering_replan_done"):
+            if llm_decision.next_agent != "diagnostic_engineer":
+                reason = f"3-Tier Hierarchy Invariant: Post-repair {post_rms:.2f} mm/s > {GMP_VIBRATION_LIMIT_RMS} limit must escalate UP to Tier 2 Reliability Engineer."
+                return (
+                    OrchestratorDecision(
+                        next_agent="diagnostic_engineer",
+                        instruction=(
+                            f"ESCALATED FROM TIER 1 TECHNICIAN: Post-repair vibration is {post_rms:.2f} mm/s RMS (> 2.5 limit). "
+                            "Consult SOPs and prescribe corrective engineering realignment plan."
+                        ),
+                        gate_decision="REJECTED",
+                        reviewed_stage="maintenance",
+                        audit_notes=f"{llm_decision.audit_notes} [{reason}]",
+                    ),
+                    reason,
+                )
+            # LLM autonomously escalated to diagnostic_engineer -> preserve LLM instruction, normalize Gate 3 reject
+            return (
+                OrchestratorDecision(
+                    next_agent="diagnostic_engineer",
+                    instruction=llm_decision.instruction,
+                    gate_decision="REJECTED",
+                    reviewed_stage="maintenance",
+                    audit_notes=llm_decision.audit_notes,
+                ),
+                None,
+            )
+
+    # Safety Law 1: Never allow SIGNED_OFF closure prematurely or while RMS > 2.5 mm/s
+    if llm_decision.next_agent == "FINISH" and llm_decision.gate_decision in ("SIGNED_OFF", "APPROVED"):
+        if maint and maint.get("post_repair_vibration_rms") is not None and float(maint["post_repair_vibration_rms"]) > GMP_VIBRATION_LIMIT_RMS:
+            target = "field_technician" if state.get("engineering_replan_done") else "diagnostic_engineer"
+            reason = f"GMP Safety Invariant: Cannot sign off while post-repair vibration ({maint['post_repair_vibration_rms']} mm/s) exceeds {GMP_VIBRATION_LIMIT_RMS} mm/s."
+            return (
+                OrchestratorDecision(
+                    next_agent=target,
+                    instruction=f"REJECTED unsafe sign-off: Execute rework until RMS <= {GMP_VIBRATION_LIMIT_RMS} mm/s.",
+                    gate_decision="REJECTED",
+                    reviewed_stage="maintenance",
+                    audit_notes=f"{llm_decision.audit_notes} [{reason}]",
+                ),
+                reason,
+            )
+        if not state.get("diagnostic_done"):
+            reason = "GMP Safety Invariant: Diagnostic assessment required before closure."
+            return (
+                OrchestratorDecision(
+                    next_agent="diagnostic_engineer",
+                    instruction="Complete Diagnostic SOP & telemetry check before closing ticket.",
+                    gate_decision="REJECTED",
+                    reviewed_stage="intake",
+                    audit_notes=f"{llm_decision.audit_notes} [{reason}]",
+                ),
+                reason,
+            )
+        if not no_part and alarm_rms > GMP_VIBRATION_LIMIT_RMS:
+            if not inv.get("reserved"):
+                reason = "GMP Material Invariant: Spare part must be reserved in SQLite before mechanical closure."
+                return (
+                    OrchestratorDecision(
+                        next_agent="stock_agent",
+                        instruction="Verify stock and propose SQL reservation before closure.",
+                        gate_decision="REJECTED",
+                        reviewed_stage="diagnostic",
+                        audit_notes=f"{llm_decision.audit_notes} [{reason}]",
+                    ),
+                    reason,
+                )
+            if not maint or maint.get("post_repair_vibration_rms") is None or float(maint["post_repair_vibration_rms"]) > GMP_VIBRATION_LIMIT_RMS:
+                reason = "GMP Maintenance Invariant: Verified <= 2.5 mm/s repair required before closure."
+                return (
+                    OrchestratorDecision(
+                        next_agent="field_technician",
+                        instruction="Complete SOP repair and post-repair vibration test <= 2.5 mm/s.",
+                        gate_decision="REJECTED",
+                        reviewed_stage="stock",
+                        audit_notes=f"{llm_decision.audit_notes} [{reason}]",
+                    ),
+                    reason,
+                )
+            if not state.get("clearance_approved"):
+                reason = "GMP Release Invariant: QA Line Clearance required before final closure."
+                return (
+                    OrchestratorDecision(
+                        next_agent="qa_clearance",
+                        instruction="Complete Tier 3 QA Line Clearance before closure.",
+                        gate_decision="REJECTED",
+                        reviewed_stage="maintenance",
+                        audit_notes=f"{llm_decision.audit_notes} [{reason}]",
+                    ),
+                    reason,
+                )
+        if not analyt.get("logged_to_db"):
+            reason = "GMP Analytics Invariant: Incident KPIs and Excel log must be recorded before SIGNED_OFF."
+            return (
+                OrchestratorDecision(
+                    next_agent="analyst_capa",
+                    instruction="Log incident KPIs and generate Monthly Excel Report before final closure.",
+                    gate_decision="APPROVED",
+                    reviewed_stage="clearance" if state.get("clearance_approved") else "diagnostic",
+                    audit_notes=f"{llm_decision.audit_notes} [{reason}]",
+                ),
+                reason,
+            )
+        # Valid closure
+        return (
+            OrchestratorDecision(
+                next_agent="FINISH",
+                instruction=llm_decision.instruction,
+                gate_decision="SIGNED_OFF",
+                reviewed_stage="closure",
+                audit_notes=llm_decision.audit_notes,
+            ),
+            None,
+        )
+
+    # Safety Law 2: Block downstream stock/repair dispatch without SOP citation + root cause
+    if llm_decision.next_agent in ("stock_agent", "field_technician", "qa_clearance"):
+        if not state.get("diagnostic_done") or not diag.get("sop_code") or not diag.get("root_cause"):
+            reason = "GMP Gate 1 Invariant: Cannot dispatch downstream agents without valid SOP citation and root cause."
+            return (
+                OrchestratorDecision(
+                    next_agent="diagnostic_engineer",
+                    instruction="REJECTED: Diagnostic Report missing valid SOP citation or root cause. Re-run RAG.",
+                    gate_decision="REJECTED",
+                    reviewed_stage="diagnostic",
+                    audit_notes=f"{llm_decision.audit_notes} [{reason}]",
+                ),
+                reason,
+            )
+
+    # Safety Law 3: Reserve spare part in SQLite before Field Technician hardware replacement
+    if llm_decision.next_agent == "field_technician" and not no_part and not inv.get("reserved"):
+        reason = "GMP Material Control Invariant: Reserve spare part in SQLite before dispatching Field Technician."
+        return (
+            OrchestratorDecision(
+                next_agent="stock_agent",
+                instruction=f"Reserve required spare part {diag.get('required_part_code', '')} in SQLite before physical work.",
+                gate_decision="PENDING",
+                reviewed_stage="stock",
+                audit_notes=f"{llm_decision.audit_notes} [{reason}]",
+            ),
+            reason,
+        )
+
+    # Require QA Line Clearance after mechanical repair before Analyst closes financials
+    if (
+        llm_decision.next_agent == "analyst_capa"
+        and not no_part
+        and alarm_rms > GMP_VIBRATION_LIMIT_RMS
+        and not state.get("clearance_approved")
+    ):
+        reason = "GMP Release Invariant: QA Line Clearance must pass after mechanical repair before financial closure."
+        return (
+            OrchestratorDecision(
+                next_agent="qa_clearance",
+                instruction="Execute Tier 3 QA Line Clearance before Analyst KPI logging.",
+                gate_decision="APPROVED" if (maint and float(maint.get("post_repair_vibration_rms", 99.0)) <= GMP_VIBRATION_LIMIT_RMS) else "PENDING",
+                reviewed_stage="maintenance",
+                audit_notes=f"{llm_decision.audit_notes} [{reason}]",
+            ),
+            reason,
+        )
+
+    # Anti-Loop Invariant: NEVER re-run analyst_capa once analytics_report is persisted
+    if llm_decision.next_agent == "analyst_capa" and analyt.get("logged_to_db"):
+        reason = "Anti-Loop Invariant: Analytics & Excel already persisted; closing protocol as SIGNED_OFF."
+        return (
+            OrchestratorDecision(
+                next_agent="FINISH",
+                instruction="Incident analytics and 4-sheet Excel report are already logged. Closing eBMR as SIGNED_OFF.",
+                gate_decision="SIGNED_OFF",
+                reviewed_stage="closure",
+                audit_notes=f"{llm_decision.audit_notes} [{reason}]",
+            ),
+            reason,
+        )
+
+    # Anti-Loop Invariant: Advance cleanly once spare part is reserved & repair hasn't run yet
+    if llm_decision.next_agent == "stock_agent" and inv.get("reserved") and not maint:
+        reason = "Anti-Loop Invariant: Part already reserved in SQLite; advancing to Field Technician."
+        return (
+            OrchestratorDecision(
+                next_agent="field_technician",
+                instruction=f"Execute SOP repair with reserved part {inv.get('reserved_part_code')} and run post-repair vibration check.",
+                gate_decision="APPROVED",
+                reviewed_stage="stock",
+                audit_notes=f"{llm_decision.audit_notes} [{reason}]",
+            ),
+            reason,
+        )
+
+    # Stage-flag normalization ONLY (never changes next_agent or LLM reasoning)
+    norm_stage = llm_decision.reviewed_stage
+    norm_gate = llm_decision.gate_decision
+    if llm_decision.next_agent == "stock_agent" and state.get("diagnostic_done") and not state.get("diagnostic_approved"):
+        norm_stage = "diagnostic"
+        norm_gate = "APPROVED"
+    elif llm_decision.next_agent == "field_technician" and inv.get("reserved") and not state.get("stock_approved"):
+        norm_stage = "stock"
+        norm_gate = "APPROVED"
+    elif llm_decision.next_agent == "field_technician" and state.get("engineering_replan_done"):
+        norm_stage = "engineering_replan"
+        norm_gate = "APPROVED"
+    elif llm_decision.next_agent == "qa_clearance" and maint and float(maint.get("post_repair_vibration_rms", 99.0)) <= GMP_VIBRATION_LIMIT_RMS:
+        norm_stage = "maintenance"
+        norm_gate = "APPROVED"
+    elif llm_decision.next_agent == "analyst_capa" and (state.get("clearance_approved") or no_part):
+        norm_stage = "clearance" if state.get("clearance_approved") else "diagnostic"
+        norm_gate = "APPROVED"
+
+    return (
+        OrchestratorDecision(
+            next_agent=llm_decision.next_agent,
+            instruction=llm_decision.instruction,
+            gate_decision=norm_gate,
+            reviewed_stage=norm_stage,
+            audit_notes=llm_decision.audit_notes,
+        ),
+        None,
+    )
+
+
 def _enforce_orchestra_interlocks(
     llm_decision: OrchestratorDecision, state: MaintenanceState
 ) -> OrchestratorDecision:
-    """Enforce mandatory GMP-QA-010 safety & hierarchy interlocks on LLM Conductor decisions."""
-    det = _evaluate_orchestra_state(state)
-
-    if det.gate_decision in ("REJECTED", "ESCALATED", "AWAITING_HUMAN"):
-        return det
-    if (
-        llm_decision.next_agent != det.next_agent
-        or llm_decision.reviewed_stage != det.reviewed_stage
-        or llm_decision.gate_decision != det.gate_decision
-    ):
-        return OrchestratorDecision(
-            next_agent=det.next_agent,
-            instruction=llm_decision.instruction or det.instruction,
-            gate_decision=det.gate_decision,
-            reviewed_stage=det.reviewed_stage,
-            audit_notes=f"{llm_decision.audit_notes} [GMP Verified: {det.audit_notes}]",
-        )
-    return llm_decision
+    """Compatibility wrapper returning validated OrchestratorDecision from invariant-only checks."""
+    validated, _ = _validate_gmp_invariants(llm_decision, state)
+    return validated
 
 
 def _build_hitl_pause_payload(
@@ -510,7 +863,7 @@ def _build_hitl_pause_payload(
     maint = state.get("maintenance_report", {})
     pr = state.get("purchase_requisition", {})
 
-    # Gate A: SQL Database Write Authorization (fires reliably even under Live LLM)
+    # Gate A: SQL Database Write Authorization
     if (
         inv.get("awaiting_sql_approval")
         and human_decisions.get("sql_reservation", {}).get("decision") != "APPROVED"
@@ -543,7 +896,7 @@ def _build_hitl_pause_payload(
             "sop_ref": f"{diag.get('sop_code', 'SOP-MNT-001')} p.{diag.get('page_number', 1)}",
         }
 
-    # Gate B: Pre-Repair Cost Authorization (before Tier 1 Technician Attempt #1)
+    # Gate B: Pre-Repair Cost Authorization
     if (
         decision.next_agent == "field_technician"
         and inv.get("reserved")
@@ -574,7 +927,7 @@ def _build_hitl_pause_payload(
             "cost_breakdown": cost_est,
         }
 
-    # Gate C: Rework Cost Authorization (after Tier 2 Engineer delivers corrective realignment spec)
+    # Gate C: Rework Cost Authorization
     if (
         decision.next_agent == "field_technician"
         and state.get("engineering_replan_done")
@@ -610,31 +963,89 @@ def _build_hitl_pause_payload(
     return None
 
 
+def _compact_orchestrator_snapshot(state: MaintenanceState) -> Dict[str, Any]:
+    """Build a token-lean (~450 token) eBMR snapshot omitting raw PDF excerpts & KPI tables."""
+    diag = state.get("diagnostic_report", {}) or {}
+    pre = state.get("precheck_report", {}) or {}
+    inv = state.get("inventory_report", {}) or {}
+    maint = state.get("maintenance_report", {}) or {}
+    replan = state.get("engineering_replan", {}) or {}
+    clr = state.get("clearance_report", {}) or {}
+    an = state.get("analytics_report", {}) or {}
+
+    return {
+        "ticket_id": state["ticket_id"],
+        "scenario_id": state.get("scenario_id"),
+        "machine_id": state["machine_id"],
+        "alarm_vibration_rms": state["alarm_vibration_rms"],
+        "symptom_summary": str(state.get("symptom_summary", ""))[:200],
+        "last_worker": state.get("last_worker"),
+        "diagnostic_done": bool(state.get("diagnostic_done")),
+        "precheck_done": bool(state.get("precheck_done")),
+        "diagnostic_approved": bool(state.get("diagnostic_approved")),
+        "stock_approved": bool(state.get("stock_approved")),
+        "escalation_to_engineer": bool(state.get("escalation_to_engineer")),
+        "engineering_replan_done": bool(state.get("engineering_replan_done")),
+        "maintenance_approved": bool(state.get("maintenance_approved")),
+        "clearance_approved": bool(state.get("clearance_approved")),
+        "analytics_logged_to_db": bool(an.get("logged_to_db")),
+        "human_decisions": state.get("human_decisions") or {},
+        "diagnostic_summary": {
+            "failure_mode": diag.get("failure_mode"),
+            "sop_code": diag.get("sop_code"),
+            "page_number": diag.get("page_number"),
+            "required_part_code": diag.get("required_part_code"),
+            "no_part_required": diag.get("no_part_required"),
+            "root_cause": str(diag.get("root_cause", ""))[:180],
+        } if diag else {},
+        "precheck_summary": {
+            "active_batch_id": pre.get("active_batch_id"),
+            "contamination_risk": pre.get("contamination_risk"),
+            "low_stock_alerts": pre.get("low_stock_alerts"),
+        } if pre else {},
+        "inventory_summary": {
+            "requested_part_code": inv.get("requested_part_code"),
+            "proposed_part_code": inv.get("proposed_part_code"),
+            "reserved_part_code": inv.get("reserved_part_code"),
+            "reserved": inv.get("reserved"),
+            "awaiting_sql_approval": inv.get("awaiting_sql_approval"),
+            "used_alternative": inv.get("used_alternative"),
+            "escalate_procurement": inv.get("escalate_procurement"),
+            "remaining_stock_qty": inv.get("remaining_stock_qty"),
+        } if inv else {},
+        "maintenance_summary": {
+            "attempt_count": maint.get("attempt_count"),
+            "post_repair_vibration_rms": maint.get("post_repair_vibration_rms"),
+            "passed_gmp_limit": maint.get("passed_gmp_limit"),
+        } if maint else {},
+        "replan_summary": {
+            "sop_ref": replan.get("sop_ref"),
+            "corrective_procedure": str(replan.get("corrective_procedure", ""))[:160],
+        } if replan else {},
+        "clearance_summary": {
+            "clearance_approved": clr.get("clearance_approved"),
+            "line_status_after_clearance": clr.get("line_status_after_clearance"),
+        } if clr else {},
+        "analytics_summary": {
+            "logged_to_db": an.get("logged_to_db"),
+            "total_cost_usd": an.get("total_cost_usd"),
+            "damage_severity": an.get("damage_severity"),
+            "excel_report_path": bool(an.get("excel_report_path")),
+        } if an else {},
+    }
+
+
 def orchestrator_node(state: MaintenanceState) -> Dict[str, Any]:
     """Central GMP Conductor orchestrating parallel specialists, 3-tier hierarchy & HITL gates."""
     iteration = int(state.get("iteration_count", 0)) + 1
     max_iters = int(state.get("max_iterations", 22))
     effective_model = state["llm_model"]
     switch_note: Optional[str] = None
+    is_live = state.get("execution_mode") != "offline_demo"
 
-    human_decisions = state.get("human_decisions", {})
     inv_state = state.get("inventory_report", {})
-    maint_state = state.get("maintenance_report", {})
-
-    just_resumed_sql = bool(
-        inv_state.get("awaiting_sql_approval")
-        and human_decisions.get("sql_reservation", {}).get("decision") == "APPROVED"
-    )
-    just_resumed_repair = bool(
-        inv_state.get("reserved")
-        and not maint_state
-        and human_decisions.get("repair_attempt_1", {}).get("decision") == "APPROVED"
-    )
-    just_resumed_rework = bool(
-        state.get("engineering_replan_done")
-        and int(maint_state.get("attempt_count", 0)) < 2
-        and human_decisions.get("rework_attempt_2", {}).get("decision") == "APPROVED"
-    )
+    raw_llm_dump: Optional[Dict[str, Any]] = None
+    interlock_reason: Optional[str] = None
 
     if iteration > max_iters:
         decision = OrchestratorDecision(
@@ -644,38 +1055,35 @@ def orchestrator_node(state: MaintenanceState) -> Dict[str, Any]:
             reviewed_stage="closure",
             audit_notes=f"Safety loop limit ({max_iters}) reached.",
         )
-    elif state.get("error_message") or state.get("execution_mode") == "offline_demo" or just_resumed_sql or just_resumed_repair or just_resumed_rework:
+        orch_source = "LLM_GUARDRAILED" if is_live else "OFFLINE_DEMO"
+    elif state.get("error_message") or not is_live:
         decision = _evaluate_orchestra_state(state)
+        orch_source = "OFFLINE_DEMO"
     else:
         try:
-            snapshot = {
-                "ticket_id": state["ticket_id"],
-                "machine_id": state["machine_id"],
-                "alarm_vibration_rms": state["alarm_vibration_rms"],
-                "diagnostic_done": state.get("diagnostic_done"),
-                "precheck_done": state.get("precheck_done"),
-                "diagnostic_approved": state.get("diagnostic_approved"),
-                "stock_approved": state.get("stock_approved"),
-                "escalation_to_engineer": state.get("escalation_to_engineer"),
-                "engineering_replan_done": state.get("engineering_replan_done"),
-                "maintenance_approved": state.get("maintenance_approved"),
-                "clearance_approved": state.get("clearance_approved"),
-                "diagnostic_report": state.get("diagnostic_report"),
-                "precheck_report": state.get("precheck_report"),
-                "inventory_report": state.get("inventory_report"),
-                "maintenance_report": state.get("maintenance_report"),
-                "engineering_replan": state.get("engineering_replan"),
-                "clearance_report": state.get("clearance_report"),
-                "analytics_report": state.get("analytics_report"),
-            }
+            snapshot = _compact_orchestrator_snapshot(state)
             sys_prompt = (
-                "You are the central GMP Quality Conductor (Orchestrator) managing a 3-tier factory hierarchy:\n"
-                "- Initial intake -> 'parallel_intake' (dispatches Diagnostic Engineer + Batch/Stock Pre-Check concurrently).\n"
-                "- After parallel intake -> verify SOP citation -> 'stock_agent'.\n"
-                "- After stock reserved -> 'field_technician' (Tier 1).\n"
-                "- If Technician post-repair > 2.5 mm/s -> REJECTED and escalate UP to 'diagnostic_engineer' (Tier 2) for engineering_replan, then back to 'field_technician'.\n"
-                "- Once <= 2.5 mm/s -> 'qa_clearance' (Tier 3) -> 'analyst_capa' -> 'FINISH' (SIGNED_OFF).\n"
-                "Return OrchestratorDecision JSON." + _lang_prompt_hint(state)
+                "You are the central Tier-3 GMP Quality Conductor (Orchestrator) governing a factory maintenance eBMR.\n"
+                "Do NOT follow a blind script—reason from the live eBMR state, Human QA decisions/comments, and sensor severity to pick the optimal next route:\n"
+                "Available Specialists:\n"
+                "- 'parallel_intake': Dispatches Tier-2 Diagnostic Engineer + Batch/Stock Pre-Check concurrently via Send() when vibration > 2.5 mm/s and neither ran yet.\n"
+                "- 'diagnostic_engineer': Tier-2 Reliability Engineer (SOP RAG + telemetry; also writes corrective alignment specs after any > 2.5 mm/s Tier-1 escalation, or re-runs weak diagnostics).\n"
+                "- 'stock_agent': Tier-2 Inventory & Auto-PO Specialist (checks SQLite, swaps qualified alternatives on stock=0, prepares/executes HITL SQL reservation).\n"
+                "- 'field_technician': Tier-1 Shop-Floor Maintenance (LOTO, part swap/realignment & vibration verification).\n"
+                "- 'qa_clearance': Tier-3 QA Line Clearance Officer (LOTO removal, tool count, wipe/CIP, stability).\n"
+                "- 'analyst_capa': Quality, Cost & CAPA Analyst (logs incident analytics, 5-Why CAPA check, exports 4-sheet .xlsx).\n"
+                "- 'FINISH': Close protocol as SIGNED_OFF (only after mandatory checks + analytics logged) or ESCALATED.\n\n"
+                "Dynamic Decision Rules:\n"
+                "0. CLOSURE CHECK FIRST: If analytics_logged_to_db is True, IMMEDIATELY return next_agent='FINISH', gate_decision='SIGNED_OFF', reviewed_stage='closure'. NEVER invoke 'analyst_capa' a second time!\n"
+                "1. If vibration <= 2.5 mm/s or symptom sounds non-mechanical/sensor-check and diagnostic_done=False -> choose 'diagnostic_engineer' directly (skip precheck).\n"
+                "2. If diagnostic_summary indicates required_part_code == 'NONE' or no_part_required=True -> bypass 'stock_agent', 'field_technician', and 'qa_clearance'; route straight to 'analyst_capa'.\n"
+                "3. If diagnostic_summary lacks valid sop_code or clear root_cause -> route back to 'diagnostic_engineer' with gate_decision='REJECTED' and tell it what to search.\n"
+                "4. If Human QA approved 'sql_reservation' in human_decisions while inventory_summary.awaiting_sql_approval=True -> route to 'stock_agent' to execute SQL write.\n"
+                "5. Once inventory_summary.reserved is True and maintenance_summary is empty -> route to 'field_technician' (do NOT re-run stock_agent).\n"
+                "6. If Tier-1 Technician returned post_repair_vibration_rms > 2.5 mm/s -> REJECT gate and escalate UP to 'diagnostic_engineer' for engineering_replan, then back to 'field_technician'.\n"
+                "7. Never sign off ('FINISH' / 'SIGNED_OFF') while analytics_logged_to_db is False or while RMS > 2.5 mm/s.\n"
+                "Return valid OrchestratorDecision JSON with clear, specific 'instruction' and evidence-citing 'audit_notes'."
+                + _lang_prompt_hint(state)
             )
 
             def _call_orch(model_id: str) -> OrchestratorDecision:
@@ -696,7 +1104,9 @@ def orchestrator_node(state: MaintenanceState) -> Dict[str, Any]:
                 )
 
             raw_decision, effective_model, switch_note = _invoke_live_with_model_fallback(state, _call_orch)
-            decision = _enforce_orchestra_interlocks(raw_decision, state)
+            raw_llm_dump = raw_decision.model_dump()
+            decision, interlock_reason = _validate_gmp_invariants(raw_decision, state)
+            orch_source = "LLM_GUARDRAILED" if interlock_reason else "LIVE_LLM"
         except Exception as exc:
             err_msg = f"LLM Conductor error ({state['llm_provider']}/{state['llm_model']}): {exc}"
             audit_entry = append_gmp_audit_log(
@@ -802,6 +1212,7 @@ def orchestrator_node(state: MaintenanceState) -> Dict[str, Any]:
         "gate_decision": gate_out,
         "instruction": decision.instruction,
         "summary": final_notes,
+        "decision_source": orch_source,
     }
 
     is_tr = str(state.get("language", "en")).lower() == "tr"
@@ -811,7 +1222,7 @@ def orchestrator_node(state: MaintenanceState) -> Dict[str, Any]:
         cmd_recv = (
             f"{state['machine_id']} üzerinde Sınır Titreşim Alarmı ({state['alarm_vibration_rms']:.1f} mm/s RMS > {GMP_VIBRATION_LIMIT_RMS} limit)"
             if is_tr
-            else f"Edge Vibration Alarm on {state['machine_id']} ({state['alarm_vibration_rms']:.1f} mm/s RMS > {GMP_VIBRATION_LIMIT_RMS} limit)"
+            else f"Edge Alarm/Event on {state['machine_id']} ({state['alarm_vibration_rms']:.1f} mm/s RMS): {state.get('symptom_summary', '')[:110]}"
         )
     else:
         cmd_recv = (
@@ -820,38 +1231,59 @@ def orchestrator_node(state: MaintenanceState) -> Dict[str, Any]:
             else f"Callback from '{state.get('last_worker', 'worker')}' after '{decision.reviewed_stage}' stage"
         )
 
-    if awaiting_human:
+    if is_live and raw_llm_dump is not None:
+        guard_prefix = f"[SAFETY VETO: {interlock_reason}] " if interlock_reason else ""
         orch_thinking = (
-            f"SQLite güncellemesi veya saha maliyet harcaması öncesinde bağlayıcı İnsan QA Onayı [{hitl_pause.get('gate_type')}] bekleniyor."
-            if is_tr
-            else f"Gate requires binding Human QA approval [{hitl_pause.get('gate_type')}] before mutating SQLite or authorizing shop-floor spend. Pausing cleanly with full preview."
+            f"{guard_prefix}LLM Conductor Reasoning: {raw_llm_dump.get('audit_notes', '')} "
+            f"-> Issued directive: \"{raw_llm_dump.get('instruction', '')}\""
         )
-        orch_delegate = f"human_qa ({hitl_pause.get('gate_type')})"
-    elif next_agent_out == "parallel_intake":
-        orch_thinking = (
-            f"Sensör ISO 20816-3 Bölge C/D sınırını aştı ({state['alarm_vibration_rms']:.1f} mm/s). 2. Kademe Teşhis Mühendisi (SOP RAG) ve Parti/Stok Ön Kontrol eşzamanlı başlatılıyor."
-            if is_tr
-            else f"Continuous edge monitor breached ISO 20816-3 Zone D/C ({state['alarm_vibration_rms']:.1f} mm/s). Dispatching Tier 2 Diagnostic Engineer (Hybrid PDF RAG) concurrently with Batch & Stock Pre-Check via Send()."
-        )
-        orch_delegate = "diagnostic_engineer + stock_precheck (Paralel)" if is_tr else "diagnostic_engineer + stock_precheck (Parallel)"
-    elif decision.reviewed_stage == "maintenance" and gate_out == "REJECTED":
-        orch_thinking = (
-            "Kapı 3 REDDEDİLDİ: Onarım sonrası titreşim 2.5 mm/s GMP limitini aştı. 1. Kademe Teknisyenden 2. Kademe Güvenilirlik Mühendisine YUKARI eskalasyon başlatılıyor."
-            if is_tr
-            else "Gate 3 REJECTED: Post-repair vibration exceeds 2.5 mm/s GMP release limit. Escalating UP from Tier 1 Technician to Tier 2 Reliability Engineer for corrective SOP procedure."
-        )
-        orch_delegate = "diagnostic_engineer (Yukarı Eskalasyon)" if is_tr else "diagnostic_engineer (Upward Escalation)"
-    else:
-        orch_thinking = (
-            f"GMP-QA-010 gereği '{decision.reviewed_stage}' kapısı incelendi -> {gate_out}. {decision.instruction}"
-            if is_tr
-            else f"Evaluated '{decision.reviewed_stage}' gate evidence per GMP-QA-010 -> {gate_out}. {decision.instruction}"
-        )
+        if awaiting_human:
+            orch_thinking += f" [Paused at Binding HITL Gate: {hitl_pause.get('gate_type')}]"
         orch_delegate = (
-            ("FINISH (eBMR Arşivlendi)" if is_tr else "FINISH (Protocol Archived)")
-            if next_agent_out == "FINISH"
-            else next_agent_out
+            f"human_qa ({hitl_pause.get('gate_type')})"
+            if awaiting_human
+            else (f"FINISH ({gate_out})" if next_agent_out == "FINISH" else next_agent_out)
         )
+        llm_payload_out = {
+            "llm_decision": raw_llm_dump,
+            "final_route": next_agent_out,
+            "interlock_override": interlock_reason,
+            "model": effective_model,
+        }
+    else:
+        llm_payload_out = None
+        if awaiting_human:
+            orch_thinking = (
+                f"SQLite güncellemesi veya saha maliyet harcaması öncesinde bağlayıcı İnsan QA Onayı [{hitl_pause.get('gate_type')}] bekleniyor."
+                if is_tr
+                else f"Gate requires binding Human QA approval [{hitl_pause.get('gate_type')}] before mutating SQLite or authorizing shop-floor spend. Pausing cleanly with full preview."
+            )
+            orch_delegate = f"human_qa ({hitl_pause.get('gate_type')})"
+        elif next_agent_out == "parallel_intake":
+            orch_thinking = (
+                f"Sensör ISO 20816-3 Bölge C/D sınırını aştı ({state['alarm_vibration_rms']:.1f} mm/s). 2. Kademe Teşhis Mühendisi (SOP RAG) ve Parti/Stok Ön Kontrol eşzamanlı başlatılıyor."
+                if is_tr
+                else f"Continuous edge monitor breached ISO 20816-3 Zone D/C ({state['alarm_vibration_rms']:.1f} mm/s). Dispatching Tier 2 Diagnostic Engineer (Hybrid PDF RAG) concurrently with Batch & Stock Pre-Check via Send()."
+            )
+            orch_delegate = "diagnostic_engineer + stock_precheck (Paralel)" if is_tr else "diagnostic_engineer + stock_precheck (Parallel)"
+        elif decision.reviewed_stage == "maintenance" and gate_out == "REJECTED":
+            orch_thinking = (
+                "Kapı 3 REDDEDİLDİ: Onarım sonrası titreşim 2.5 mm/s GMP limitini aştı. 1. Kademe Teknisyenden 2. Kademe Güvenilirlik Mühendisine YUKARI eskalasyon başlatılıyor."
+                if is_tr
+                else "Gate 3 REJECTED: Post-repair vibration exceeds 2.5 mm/s GMP release limit. Escalating UP from Tier 1 Technician to Tier 2 Reliability Engineer for corrective SOP procedure."
+            )
+            orch_delegate = "diagnostic_engineer (Yukarı Eskalasyon)" if is_tr else "diagnostic_engineer (Upward Escalation)"
+        else:
+            orch_thinking = (
+                f"GMP-QA-010 gereği '{decision.reviewed_stage}' kapısı incelendi -> {gate_out}. {decision.instruction}"
+                if is_tr
+                else f"Evaluated '{decision.reviewed_stage}' gate evidence per GMP-QA-010 -> {gate_out}. {decision.instruction}"
+            )
+            orch_delegate = (
+                ("FINISH (eBMR Arşivlendi)" if is_tr else "FINISH (Protocol Archived)")
+                if next_agent_out == "FINISH"
+                else next_agent_out
+            )
 
     orch_trace = _make_trace(
         node="orchestrator",
@@ -864,6 +1296,8 @@ def orchestrator_node(state: MaintenanceState) -> Dict[str, Any]:
         delegated_to=orch_delegate,
         timestamp_utc=audit_entry["timestamp_utc"],
         lang=lang_code,
+        decision_source=orch_source,
+        llm_raw_payload=llm_payload_out,
     )
 
     return {
@@ -896,7 +1330,9 @@ def orchestrator_node(state: MaintenanceState) -> Dict[str, Any]:
 def diagnostic_engineer_node(state: MaintenanceState) -> Dict[str, Any]:
     machine_id = state["machine_id"]
     effective_model = state["llm_model"]
-    sc = DEMO_SCENARIOS.get(state["scenario_id"], {})
+    is_live = state.get("execution_mode") != "offline_demo"
+    # IMPORTANT: Never leak preset scenario ground truth into Live LLM reasoning!
+    sc = {} if is_live else DEMO_SCENARIOS.get(state["scenario_id"], {})
     is_tr = str(state.get("language", "en")).lower() == "tr"
     lang_code = "tr" if is_tr else "en"
     new_tool_calls: List[Dict[str, Any]] = []
@@ -905,12 +1341,13 @@ def diagnostic_engineer_node(state: MaintenanceState) -> Dict[str, Any]:
     if state.get("escalation_to_engineer") and not state.get("engineering_replan_done"):
         maint = state.get("maintenance_report", {})
         measured_rms = maint.get("post_repair_vibration_rms", sc.get("fail_attempt1_rms") or 4.8)
-        replan_sop = str(sc.get("replan_sop_ref") or "SOP-MNT-002 p.3")
-        replan_proc_hint = str(sc.get("replan_procedure") or "Cold Dual-Beam Laser Shaft Realignment")
-        query = f"{machine_id} {replan_sop} {replan_proc_hint} post-repair vibration > 2.5 mm/s"
         raw_llm_json: Dict[str, Any] = {}
+        executed_tools: List[Dict[str, Any]] = []
 
-        if state.get("execution_mode") == "offline_demo":
+        if not is_live:
+            replan_sop = str(sc.get("replan_sop_ref") or "SOP-MNT-002 p.3")
+            replan_proc_hint = str(sc.get("replan_procedure") or "Cold Dual-Beam Laser Shaft Realignment")
+            query = f"{machine_id} {replan_sop} {replan_proc_hint} post-repair vibration > 2.5 mm/s"
             rag = search_sop_manuals_impl(query, top_k=2)
             new_tool_calls.append(
                 {
@@ -921,13 +1358,26 @@ def diagnostic_engineer_node(state: MaintenanceState) -> Dict[str, Any]:
                     "timestamp_utc": _utc_now(),
                 }
             )
+            default_root = (
+                f"160 deg C sealing platen thermal frame bow & cold bearing fit misalignment ({measured_rms} mm/s RMS)."
+                if machine_id == "PK-02"
+                else f"1x/2x axial coupling misalignment & motor soft-foot distortion ({measured_rms} mm/s RMS)."
+            )
+            replan = {
+                "escalated_from_rms": measured_rms,
+                "root_cause_of_failure": default_root,
+                "corrective_procedure": replan_proc_hint,
+                "alignment_tolerance": str(sc.get("replan_tolerance") or "Soft foot < 0.05 mm; Parallel <= 0.05 mm TIR; Angular <= 0.05 mm/100mm"),
+                "torque_spec_nm": "38 Nm hot platen retorque" if machine_id == "PK-02" else "55 Nm calibrated star torque",
+                "sop_ref": replan_sop,
+            }
         else:
             try:
                 sys_prompt = (
                     "You are the Tier 2 Reliability Engineer.\n"
                     "The Tier 1 Field Technician escalated a failed post-repair vibration check (> 2.5 mm/s).\n"
                     "Call search_sop_manuals(query) for corrective alignment/parallelism tolerances and output JSON with keys: "
-                    "root_cause_of_failure, corrective_procedure, alignment_tolerance, torque_spec_nm, sop_ref."
+                    "root_cause_of_failure, corrective_procedure, alignment_tolerance, torque_spec_nm, sop_ref, reasoning."
                     + _lang_prompt_hint(state)
                 )
                 task_prompt = (
@@ -950,8 +1400,8 @@ def diagnostic_engineer_node(state: MaintenanceState) -> Dict[str, Any]:
                         pacing_delay=float(state.get("pacing_delay_sec", 0.3)),
                     )
 
-                (raw_text, executed), effective_model, _ = _invoke_live_with_model_fallback(state, _call_replan)
-                for ex in executed:
+                (raw_text, executed_tools), effective_model, _ = _invoke_live_with_model_fallback(state, _call_replan)
+                for ex in executed_tools:
                     new_tool_calls.append({"agent": "Reliability Engineer (Tier 2)", **ex})
                 raw_llm_json = _safe_parse_json(raw_text)
             except Exception as exc:
@@ -961,28 +1411,26 @@ def diagnostic_engineer_node(state: MaintenanceState) -> Dict[str, Any]:
                     "tool_calls_log": new_tool_calls,
                 }
 
-        ctx = get_active_run_context()
-        default_root = (
-            f"160 deg C sealing platen thermal frame bow & cold bearing fit misalignment ({measured_rms} mm/s RMS)."
-            if machine_id == "PK-02"
-            else f"1x/2x axial coupling misalignment & motor soft-foot distortion ({measured_rms} mm/s RMS)."
-        )
-        replan = {
-            "escalated_from_rms": measured_rms,
-            "root_cause_of_failure": str(raw_llm_json.get("root_cause_of_failure") or default_root),
-            "corrective_procedure": str(raw_llm_json.get("corrective_procedure") or replan_proc_hint),
-            "alignment_tolerance": str(
-                raw_llm_json.get("alignment_tolerance")
-                or sc.get("replan_tolerance")
-                or "Soft foot < 0.05 mm; Parallel <= 0.05 mm TIR; Angular <= 0.05 mm/100mm"
-            ),
-            "torque_spec_nm": str(
-                raw_llm_json.get("torque_spec_nm")
-                or ("38 Nm hot platen retorque" if machine_id == "PK-02" else "55 Nm calibrated star torque")
-            ),
-            "sop_ref": str(raw_llm_json.get("sop_ref") or replan_sop),
-        }
+            ctx_r = get_active_run_context()
+            rag_top = (ctx_r.rag_chunks[-1] if (ctx_r and ctx_r.rag_chunks) else {})
+            rag_ref = f"{rag_top.get('sop_code', 'SOP-MNT-002')} p.{rag_top.get('page_number', 3)}"
+            replan = {
+                "escalated_from_rms": measured_rms,
+                "root_cause_of_failure": str(
+                    raw_llm_json.get("root_cause_of_failure")
+                    or raw_llm_json.get("reasoning")
+                    or f"Residual post-repair vibration ({measured_rms} mm/s RMS) exceeding 2.5 mm/s limit."
+                ),
+                "corrective_procedure": str(
+                    raw_llm_json.get("corrective_procedure")
+                    or "Precision Laser Realignment & Base Bolt Retorque per cited SOP"
+                ),
+                "alignment_tolerance": str(raw_llm_json.get("alignment_tolerance") or "<= 0.05 mm TIR / <= 2.5 mm/s RMS"),
+                "torque_spec_nm": str(raw_llm_json.get("torque_spec_nm") or "Per cited SOP torque table"),
+                "sop_ref": str(raw_llm_json.get("sop_ref") or rag_ref),
+            }
 
+        ctx = get_active_run_context()
         audit_entry = append_gmp_audit_log(
             ticket_id=state["ticket_id"],
             step_number=_next_step_num(state),
@@ -990,6 +1438,20 @@ def diagnostic_engineer_node(state: MaintenanceState) -> Dict[str, Any]:
             action_summary="Escalation RCA & Corrective Alignment Prescription",
             gate_decision="APPROVED",
             audit_notes=f"Diagnosed {measured_rms} mm/s failure -> Prescribed {replan['corrective_procedure']} ({replan['sop_ref']}).",
+        )
+        live_actions = (
+            [f"{ex['tool']}({json.dumps(ex.get('args', {}), ensure_ascii=False)})" for ex in executed_tools]
+            if executed_tools
+            else [f"search_sop_manuals(...) -> {replan['sop_ref']}"]
+        )
+        replan_think = (
+            str(raw_llm_json.get("reasoning") or raw_llm_json.get("root_cause_of_failure") or replan["root_cause_of_failure"])
+            if is_live
+            else (
+                f"1. deneme hata spektrumu incelendi ({replan['root_cause_of_failure']}). Hibrit SOP RAG ({replan['sop_ref']}) sorgulanarak bağlayıcı tolerans belirlendi: '{replan['alignment_tolerance']}'."
+                if is_tr
+                else f"Analyzed Attempt #1 failure spectrum ({replan['root_cause_of_failure']}). Queried Hybrid SOP RAG ({replan['sop_ref']}) to author binding tolerance '{replan['alignment_tolerance']}'."
+            )
         )
         replan_trace = _make_trace(
             node="diagnostic_engineer",
@@ -1000,19 +1462,14 @@ def diagnostic_engineer_node(state: MaintenanceState) -> Dict[str, Any]:
                 if is_tr
                 else f"ESCALATED FROM TIER 1 TECHNICIAN via Conductor: Attempt #1 measured {measured_rms} mm/s (> 2.5)"
             ),
-            thinking=(
-                f"1. deneme hata spektrumu incelendi ({default_root}). Hibrit SOP RAG ({replan['sop_ref']}) sorgulanarak bağlayıcı tolerans belirlendi: '{replan['alignment_tolerance']}'."
-                if is_tr
-                else f"Analyzed Attempt #1 failure spectrum ({default_root}). Queried Hybrid SOP RAG ({replan['sop_ref']}) to author binding engineering tolerance '{replan['alignment_tolerance']}'."
-            ),
-            actions_taken=[
-                f"search_sop_manuals('{query[:65]}...')",
-                f"Issued Engineering Replan ({replan['sop_ref']})",
-            ],
+            thinking=replan_think,
+            actions_taken=live_actions,
             output_verdict=f"Reçete / Prescribed: {replan['corrective_procedure']} [Tork: {replan['torque_spec_nm']}]",
             delegated_to="orchestrator -> field_technician (2. Deneme)" if is_tr else "orchestrator -> field_technician (Attempt #2)",
             timestamp_utc=audit_entry["timestamp_utc"],
             lang=lang_code,
+            decision_source="LIVE_LLM" if is_live else "OFFLINE_DEMO",
+            llm_raw_payload={"llm_json": raw_llm_json, "tool_calls": executed_tools} if is_live else None,
         )
         return {
             "llm_model": effective_model,
@@ -1033,12 +1490,13 @@ def diagnostic_engineer_node(state: MaintenanceState) -> Dict[str, Any]:
             "agent_traces": [replan_trace],
         }
 
-    # Initial Parallel Intake Mode: Multi-Sensor Telemetry + Hybrid PDF SOP RAG
+    # Initial Intake Mode: Multi-Sensor Telemetry + Hybrid PDF SOP RAG
     query = f"{machine_id} {state['alarm_type']} {state['symptom_summary']}"
     raw_llm_json = {}
+    executed_tools = []
     telemetry_snap: Dict[str, Any] = {}
 
-    if state.get("execution_mode") == "offline_demo":
+    if not is_live:
         telemetry_snap = read_sensor_telemetry_impl(machine_id)
         rag = search_sop_manuals_impl(query, top_k=3)
         new_tool_calls.extend(
@@ -1063,15 +1521,19 @@ def diagnostic_engineer_node(state: MaintenanceState) -> Dict[str, Any]:
         try:
             sys_prompt = (
                 "You are the Tier 2 Reliability & Diagnostic Engineer.\n"
-                "1. Call read_sensor_telemetry(machine_id) and search_sop_manuals(query).\n"
-                "2. Identify failure mode, cite SOP code, filename, and page number.\n"
-                "3. Specify exact required_part_code (BRG-4402, LUB-3010, RLR-4450, SL-8810, IMP-8825, SHM-8805, BLT-2205, SRV-2240, or BRG-2290).\n"
-                "Respond with pure JSON keys: failure_mode, root_cause, sop_code, sop_filename, "
-                "page_number, required_part_code, required_tools." + _lang_prompt_hint(state)
+                "1. Always call read_sensor_telemetry(machine_id) and search_sop_manuals(query) with a focused technical query derived strictly from the symptom & telemetry.\n"
+                "2. Inspect the live sensor readings and retrieved SOP excerpts.\n"
+                "3. Determine if physical spare-part replacement is truly required:\n"
+                "   - If RMS vibration <= 2.5 mm/s, temperatures/amps are normal, or symptom indicates a sensor cable/calibration check/false alarm -> set no_part_required=true and required_part_code='NONE'.\n"
+                "   - Otherwise identify exact required_part_code from SOP hits (BRG-4402, LUB-3010, RLR-4450, SL-8810, IMP-8825, SHM-8805, BLT-2205, SRV-2240, BRG-2290, GKT-1102, or SNS-9010).\n"
+                "Respond with pure JSON keys: failure_mode, root_cause, reasoning, sop_code, sop_filename, "
+                "page_number, required_part_code, no_part_required, required_tools."
+                + _lang_prompt_hint(state)
             )
             task_prompt = (
                 f"Ticket: {state['ticket_id']} | Machine: {machine_id} | Trigger: {state.get('trigger_source')}\n"
-                f"Symptom: {state['symptom_summary']}"
+                f"Conductor Instruction: {state.get('current_instruction')}\n"
+                f"Symptom / Observation: {state['symptom_summary']}"
             )
 
             def _call_diag(model_id: str) -> Tuple[str, List[Dict[str, Any]]]:
@@ -1079,7 +1541,7 @@ def diagnostic_engineer_node(state: MaintenanceState) -> Dict[str, Any]:
                     provider=state["llm_provider"],
                     model=model_id,
                     api_key=state.get("api_key"),
-                    temperature=0.1,
+                    temperature=0.0,
                 )
                 return _run_specialist_tool_loop(
                     llm=llm,
@@ -1089,8 +1551,8 @@ def diagnostic_engineer_node(state: MaintenanceState) -> Dict[str, Any]:
                     pacing_delay=float(state.get("pacing_delay_sec", 0.3)),
                 )
 
-            (raw_text, executed), effective_model, _ = _invoke_live_with_model_fallback(state, _call_diag)
-            for ex in executed:
+            (raw_text, executed_tools), effective_model, _ = _invoke_live_with_model_fallback(state, _call_diag)
+            for ex in executed_tools:
                 new_tool_calls.append({"agent": "Reliability Engineer (Tier 2)", **ex})
             raw_llm_json = _safe_parse_json(raw_text)
         except Exception as exc:
@@ -1105,21 +1567,56 @@ def diagnostic_engineer_node(state: MaintenanceState) -> Dict[str, Any]:
         telemetry_snap = (ctx.telemetry_readings[-1] if (ctx and ctx.telemetry_readings) else read_sensor_telemetry_impl(machine_id))
     rag_hits = list(ctx.rag_chunks) if ctx and ctx.rag_chunks else search_sop_manuals_impl(query, top_k=3)["results"]
     top_hit = rag_hits[0] if rag_hits else {}
-    expected_part = str(sc.get("expected_part_code", "BRG-4402"))
 
-    part_match = re.search(
-        r"\b(BRG-4402(?:-ALT)?|LUB-3010|RLR-4450(?:-ALT)?|SL-8810(?:-ALT)?|IMP-8825|SHM-8805|BLT-2205(?:-ALT)?|SRV-2240|BRG-2290)\b",
-        str(raw_llm_json.get("required_part_code", "")).upper(),
-    )
-    required_part = part_match.group(1) if part_match else expected_part
+    part_regex = r"\b(BRG-4402(?:-ALT)?|LUB-3010|RLR-4450(?:-ALT)?|SL-8810(?:-ALT)?|IMP-8825|SHM-8805|BLT-2205(?:-ALT)?|SRV-2240|BRG-2290|GKT-1102|SNS-9010|NONE|NO_PART|CALIBRATION_ONLY)\b"
+    raw_part_val = str(raw_llm_json.get("required_part_code", "")).upper()
+    part_match = re.search(part_regex, raw_part_val)
+    is_no_part = bool(raw_llm_json.get("no_part_required")) or (part_match and part_match.group(1) in ("NONE", "NO_PART", "CALIBRATION_ONLY"))
+
+    if not is_live:
+        if state.get("scenario_id") == "custom_unseen" and float(state.get("alarm_vibration_rms", 0.0)) <= GMP_VIBRATION_LIMIT_RMS:
+            required_part = "NONE"
+            is_no_part = True
+        else:
+            required_part = str(sc.get("expected_part_code", "BRG-4402"))
+    else:
+        if is_no_part:
+            required_part = "NONE"
+        elif part_match:
+            required_part = part_match.group(1)
+        else:
+            # Recover solely from real RAG text if LLM omitted exact part token; NEVER read DEMO_SCENARIOS!
+            rag_excerpt = " ".join(str(h.get("excerpt", "")) for h in rag_hits[:2]).upper()
+            rag_match = re.search(part_regex, rag_excerpt)
+            if float(telemetry_snap.get("measured_vibration_rms", state["alarm_vibration_rms"])) <= GMP_VIBRATION_LIMIT_RMS:
+                required_part = "NONE"
+                is_no_part = True
+            elif rag_match and rag_match.group(1) not in ("NONE", "NO_PART", "CALIBRATION_ONLY"):
+                required_part = rag_match.group(1)
+            else:
+                required_part = "NONE"
+                is_no_part = True
 
     sop_code = str(raw_llm_json.get("sop_code") or top_hit.get("sop_code") or sc.get("expected_sop_code") or "SOP-MNT-001")
     sop_filename = str(raw_llm_json.get("sop_filename") or top_hit.get("filename") or "")
-    page_num = int(raw_llm_json.get("page_number") or top_hit.get("page_number") or sc.get("expected_sop_page") or 2)
+    try:
+        page_num = int(raw_llm_json.get("page_number") or top_hit.get("page_number") or sc.get("expected_sop_page") or 1)
+    except (TypeError, ValueError):
+        page_num = int(top_hit.get("page_number") or 1)
 
-    def_fm = str(sc.get("failure_mode_title") or state.get("alarm_type") or "Vibration Anomaly")
-    def_rc = str(sc.get("root_cause_summary") or state["symptom_summary"])
-    def_tools = sc.get("required_tools") or ["Calibrated torque wrench", "Tri-axial vibration analyzer"]
+    if is_live:
+        def_fm = str(raw_llm_json.get("failure_mode") or state.get("alarm_type") or "Sensor & Vibration Evaluation")
+        def_rc = str(raw_llm_json.get("root_cause") or top_hit.get("excerpt", state["symptom_summary"])[:240])
+        def_tools = raw_llm_json.get("required_tools") or ["Tri-axial vibration analyzer"]
+    else:
+        if is_no_part:
+            def_fm = "Sensor Signal Verification / Non-Mechanical Check"
+            def_rc = f"Measured RMS {telemetry_snap.get('measured_vibration_rms')} mm/s within GMP threshold (<= 2.5); verified sensor/wiring without part swap ({sop_code} p.{page_num})."
+            def_tools = ["Signal continuity tester", "Tri-axial vibration analyzer"]
+        else:
+            def_fm = str(sc.get("failure_mode_title") or state.get("alarm_type") or "Vibration Anomaly")
+            def_rc = str(sc.get("root_cause_summary") or state["symptom_summary"])
+            def_tools = sc.get("required_tools") or ["Calibrated torque wrench", "Tri-axial vibration analyzer"]
 
     report = {
         "machine_id": machine_id,
@@ -1129,6 +1626,7 @@ def diagnostic_engineer_node(state: MaintenanceState) -> Dict[str, Any]:
         "sop_filename": sop_filename,
         "page_number": page_num,
         "required_part_code": required_part,
+        "no_part_required": bool(is_no_part),
         "required_tools": raw_llm_json.get("required_tools") or def_tools,
         "rag_evidence": rag_hits[:3],
         "telemetry_snapshot": telemetry_snap,
@@ -1141,37 +1639,50 @@ def diagnostic_engineer_node(state: MaintenanceState) -> Dict[str, Any]:
         ticket_id=state["ticket_id"],
         step_number=_next_step_num(state),
         agent_name="Reliability Engineer (Tier 2)",
-        action_summary=f"Parallel SOP RAG ({sop_code} p.{page_num}) & Multi-Sensor Telemetry",
+        action_summary=f"SOP RAG ({sop_code} p.{page_num}) & Multi-Sensor Telemetry",
         gate_decision="PENDING",
-        audit_notes=f"Diagnosed '{report['failure_mode']}'; part required: {required_part}.",
+        audit_notes=f"Diagnosed '{report['failure_mode']}'; required_part={required_part}.",
+    )
+
+    diag_think = (
+        str(raw_llm_json.get("reasoning") or raw_llm_json.get("root_cause") or report["root_cause"])
+        if is_live
+        else (
+            f"Canlı sensör zarfı okundu (RMS={telemetry_snap.get('measured_vibration_rms', state['alarm_vibration_rms'])} mm/s, "
+            f"Frekans={telemetry_snap.get('dominant_frequency_hz', 'N/A')} Hz, Kurtosis={telemetry_snap.get('kurtosis', 'N/A')}, "
+            f"Sıcaklık={telemetry_snap.get('housing_temperature_c', 'N/A')} C). "
+            f"Hibrit RAG {sop_code} s.{page_num} eşleştirdi: '{report['failure_mode']}' -> Parça: {required_part}."
+            if is_tr
+            else (
+                f"Inspected live sensor envelope (RMS={telemetry_snap.get('measured_vibration_rms', state['alarm_vibration_rms'])} mm/s, "
+                f"Freq={telemetry_snap.get('dominant_frequency_hz', 'N/A')} Hz, Kurtosis={telemetry_snap.get('kurtosis', 'N/A')}, "
+                f"Temp={telemetry_snap.get('housing_temperature_c', 'N/A')} C). "
+                f"Retrieved {sop_code} p.{page_num} confirming '{report['failure_mode']}' -> required_part={required_part}."
+            )
+        )
+    )
+    diag_actions = (
+        [f"{ex['tool']}({json.dumps(ex.get('args', {}), ensure_ascii=False)})" for ex in executed_tools]
+        if (is_live and executed_tools)
+        else [
+            f"read_sensor_telemetry('{machine_id}')",
+            f"search_sop_manuals(...) -> Top hit {sop_code} p.{page_num} (score {top_hit.get('score', 0.0)})",
+        ]
     )
 
     diag_trace = _make_trace(
         node="diagnostic_engineer",
         tier="Tier 2 Reliability Engineering",
         agent_name="Reliability & Diagnostic Engineer",
-        command_received=str(state.get("current_instruction") or f"Diagnose {machine_id} vibration alarm via SOP RAG"),
-        thinking=(
-            f"Canlı sensör zarfı okundu (RMS={telemetry_snap.get('measured_vibration_rms', state['alarm_vibration_rms'])} mm/s, "
-            f"Frekans={telemetry_snap.get('dominant_frequency_hz', 'N/A')} Hz, Kurtosis={telemetry_snap.get('kurtosis', 'N/A')}, "
-            f"Sıcaklık={telemetry_snap.get('housing_temperature_c', 'N/A')} C). "
-            f"Hibrit RAG {sop_code} s.{page_num} eşleştirdi: '{report['failure_mode']}' -> Gerekli parça {required_part}."
-            if is_tr
-            else (
-                f"Inspected live sensor envelope (RMS={telemetry_snap.get('measured_vibration_rms', state['alarm_vibration_rms'])} mm/s, "
-                f"Freq={telemetry_snap.get('dominant_frequency_hz', 'N/A')} Hz, Kurtosis={telemetry_snap.get('kurtosis', 'N/A')}, "
-                f"Temp={telemetry_snap.get('housing_temperature_c', 'N/A')} C). "
-                f"Retrieved {sop_code} p.{page_num} confirming '{report['failure_mode']}' -> requires {required_part}."
-            )
-        ),
-        actions_taken=[
-            f"read_sensor_telemetry('{machine_id}')",
-            f"search_sop_manuals(...) -> Top hit {sop_code} p.{page_num} (score {top_hit.get('score', 0.0)})",
-        ],
-        output_verdict=f"Kök Neden / Root Cause: {report['failure_mode']} | Parça: {required_part} | Ref: {sop_code} p.{page_num}",
-        delegated_to="orchestrator (Kapı 1 Teşhis Onayı)" if is_tr else "orchestrator (Gate 1 Diagnostic Verification)",
+        command_received=str(state.get("current_instruction") or f"Diagnose {machine_id} vibration telemetry via SOP RAG"),
+        thinking=diag_think,
+        actions_taken=diag_actions,
+        output_verdict=f"Root Cause: {report['failure_mode']} | Part: {required_part} | Ref: {sop_code} p.{page_num}",
+        delegated_to="orchestrator (Gate 1 Verification)",
         timestamp_utc=audit_entry["timestamp_utc"],
         lang=lang_code,
+        decision_source="LIVE_LLM" if is_live else "OFFLINE_DEMO",
+        llm_raw_payload={"llm_json": raw_llm_json, "tool_calls": executed_tools} if is_live else None,
     )
 
     return {
@@ -1204,11 +1715,14 @@ def stock_precheck_node(state: MaintenanceState) -> Dict[str, Any]:
     """Runs concurrently with Diagnostic Engineer via LangGraph Send() fan-out."""
     machine_id = state["machine_id"]
     effective_model = state["llm_model"]
+    is_live = state.get("execution_mode") != "offline_demo"
     is_tr = str(state.get("language", "en")).lower() == "tr"
     lang_code = "tr" if is_tr else "en"
     new_tool_calls: List[Dict[str, Any]] = []
+    executed_tools: List[Dict[str, Any]] = []
+    raw_llm_json: Dict[str, Any] = {}
 
-    if state.get("execution_mode") == "offline_demo":
+    if not is_live:
         sql_str = (
             f"SELECT part_code, part_name, stock_qty, min_reorder_qty, bin_location, compatible_alt_code "
             f"FROM spare_parts_inventory WHERE machine_id = '{machine_id}'"
@@ -1239,7 +1753,7 @@ def stock_precheck_node(state: MaintenanceState) -> Dict[str, Any]:
                 "You are the Parallel Batch-Risk & Stock Readiness Specialist.\n"
                 "1. Call assess_batch_risk(machine_id).\n"
                 "2. Call query_inventory_sql to inspect all spare parts for that machine_id.\n"
-                "Return concise JSON with batch_id and low_stock_parts." + _lang_prompt_hint(state)
+                "Return concise JSON with batch_id, low_stock_parts, and reasoning." + _lang_prompt_hint(state)
             )
             task_prompt = f"Machine: {machine_id} | Ticket: {state['ticket_id']}"
 
@@ -1258,11 +1772,14 @@ def stock_precheck_node(state: MaintenanceState) -> Dict[str, Any]:
                     pacing_delay=float(state.get("pacing_delay_sec", 0.3)),
                 )
 
-            (_, executed), effective_model, _ = _invoke_live_with_model_fallback(state, _call_precheck)
-            for ex in executed:
+            (raw_text, executed_tools), effective_model, _ = _invoke_live_with_model_fallback(state, _call_precheck)
+            for ex in executed_tools:
                 new_tool_calls.append({"agent": "Batch & Stock Pre-Check", **ex})
-            batch_risk = assess_batch_risk_impl(machine_id)
-            inv_snap = query_inventory_sql_impl(
+            raw_llm_json = _safe_parse_json(raw_text)
+
+            ctx_p = get_active_run_context()
+            batch_risk = (ctx_p.batch_risk_report if (ctx_p and ctx_p.batch_risk_report) else assess_batch_risk_impl(machine_id))
+            inv_snap = {"rows": ctx_p.sql_queries[-1].get("rows_preview", [])} if (ctx_p and ctx_p.sql_queries) else query_inventory_sql_impl(
                 f"SELECT part_code, stock_qty, min_reorder_qty, compatible_alt_code FROM spare_parts_inventory WHERE machine_id = '{machine_id}'"
             )
         except Exception as exc:
@@ -1288,6 +1805,27 @@ def stock_precheck_node(state: MaintenanceState) -> Dict[str, Any]:
         audit_notes=f"Risk: {batch_risk['contamination_risk']}; Low-stock alerts: {low_stock or 'None'}.",
     )
 
+    pre_think = (
+        str(raw_llm_json.get("reasoning") or f"LLM inspected batch {batch_risk['active_batch_id']} ({batch_risk['contamination_risk']}) & inventory ({len(inv_snap.get('rows', []))} parts).")
+        if is_live
+        else (
+            f"Aktif parti {batch_risk['active_batch_id']} ({batch_risk['contamination_risk']} risk) eşzamanlı incelendi ve SQLite envanteri ({len(inv_snap.get('rows', []))} parça; kritik stok={low_stock or 'Yok'}) sorgulandı."
+            if is_tr
+            else (
+                f"Concurrently inspected active batch {batch_risk['active_batch_id']} ({batch_risk['contamination_risk']} risk) "
+                f"and queried SQLite inventory ({len(inv_snap.get('rows', []))} asset parts checked; low stock alerts={low_stock or 'None'})."
+            )
+        )
+    )
+    pre_actions = (
+        [f"{ex['tool']}({json.dumps(ex.get('args', {}), ensure_ascii=False)})" for ex in executed_tools]
+        if (is_live and executed_tools)
+        else [
+            f"assess_batch_risk('{machine_id}') -> {batch_risk['active_batch_id']} Quarantined",
+            f"query_inventory_sql(...) -> Low stock: {low_stock or 'None'}",
+        ]
+    )
+
     precheck_trace = _make_trace(
         node="stock_precheck",
         tier="Tier 2 Operations & Batch QA",
@@ -1297,18 +1835,8 @@ def stock_precheck_node(state: MaintenanceState) -> Dict[str, Any]:
             if is_tr
             else f"Parallel Fan-Out via Send(): Assess GMP lot risk & SQLite readiness for {machine_id}"
         ),
-        thinking=(
-            f"Aktif parti {batch_risk['active_batch_id']} ({batch_risk['contamination_risk']} risk) eşzamanlı incelendi ve SQLite envanteri ({len(inv_snap.get('rows', []))} parça; kritik stok={low_stock or 'Yok'}) sorgulandı."
-            if is_tr
-            else (
-                f"Concurrently inspected active batch {batch_risk['active_batch_id']} ({batch_risk['contamination_risk']} risk) "
-                f"and queried SQLite inventory ({len(inv_snap.get('rows', []))} asset parts checked; low stock alerts={low_stock or 'None'})."
-            )
-        ),
-        actions_taken=[
-            f"assess_batch_risk('{machine_id}') -> {batch_risk['active_batch_id']} Quarantined",
-            f"query_inventory_sql(...) -> Low stock: {low_stock or 'None'}",
-        ],
+        thinking=pre_think,
+        actions_taken=pre_actions,
         output_verdict=(
             f"Parti {batch_risk['active_batch_id']} QA Karantinasına Alındı | Kritik Stok: {low_stock or 'Yok'}"
             if is_tr
@@ -1317,6 +1845,8 @@ def stock_precheck_node(state: MaintenanceState) -> Dict[str, Any]:
         delegated_to="orchestrator (Paralel Senkron Tamam)" if is_tr else "orchestrator (Parallel Sync Complete)",
         timestamp_utc=audit_entry["timestamp_utc"],
         lang=lang_code,
+        decision_source="LIVE_LLM" if is_live else "OFFLINE_DEMO",
+        llm_raw_payload={"llm_json": raw_llm_json, "tool_calls": executed_tools} if is_live else None,
     )
 
     return {
@@ -1345,11 +1875,16 @@ def stock_precheck_node(state: MaintenanceState) -> Dict[str, Any]:
 
 def stock_agent_node(state: MaintenanceState) -> Dict[str, Any]:
     diag = state.get("diagnostic_report", {})
-    req_part = str(diag.get("required_part_code") or DEMO_SCENARIOS[state["scenario_id"]]["expected_part_code"]).upper()
+    is_live = state.get("execution_mode") != "offline_demo"
+    req_part = str(
+        diag.get("required_part_code")
+        or ("" if is_live else DEMO_SCENARIOS.get(state["scenario_id"], {}).get("expected_part_code", "BRG-4402"))
+    ).upper()
     ticket_id = state["ticket_id"]
     is_tr = str(state.get("language", "en")).lower() == "tr"
     lang_code = "tr" if is_tr else "en"
     new_tool_calls: List[Dict[str, Any]] = []
+    executed_tools: List[Dict[str, Any]] = []
     raw_llm_json: Dict[str, Any] = {}
     pr_result: Dict[str, Any] = dict(state.get("purchase_requisition", {}))
 
@@ -1372,7 +1907,7 @@ def stock_agent_node(state: MaintenanceState) -> Dict[str, Any]:
                 "timestamp_utc": _utc_now(),
             }
         )
-    elif state.get("execution_mode") == "offline_demo":
+    elif not is_live:
         sql_str = (
             f"SELECT part_code, part_name, stock_qty, min_reorder_qty, bin_location, unit_cost_usd, compatible_alt_code "
             f"FROM spare_parts_inventory WHERE part_code = '{req_part}'"
@@ -1456,7 +1991,7 @@ def stock_agent_node(state: MaintenanceState) -> Dict[str, Any]:
                 "You are the Tier 2 Stock & Procurement SQL Specialist.\n"
                 "1. Run query_inventory_sql (SELECT only) for the required part.\n"
                 f"2. {rule}\n"
-                "Return JSON summarizing part availability, PO status, and reservation."
+                "Return JSON summarizing part availability, PO status, reservation, and reasoning."
                 + _lang_prompt_hint(state)
             )
             task_prompt = f"Ticket: {ticket_id} | Required Part: {req_part}\nInstruction: {state.get('current_instruction')}"
@@ -1476,8 +2011,8 @@ def stock_agent_node(state: MaintenanceState) -> Dict[str, Any]:
                     pacing_delay=float(state.get("pacing_delay_sec", 0.3)),
                 )
 
-            (raw_text, executed), effective_model, _ = _invoke_live_with_model_fallback(state, _call_stock)
-            for ex in executed:
+            (raw_text, executed_tools), effective_model, _ = _invoke_live_with_model_fallback(state, _call_stock)
+            for ex in executed_tools:
                 new_tool_calls.append({"agent": "Stock & Procurement", **ex})
             raw_llm_json = _safe_parse_json(raw_text)
         except Exception as exc:
@@ -1566,7 +2101,7 @@ def stock_agent_node(state: MaintenanceState) -> Dict[str, Any]:
             notes = f"Zero inventory available for {req_part} or alternatives."
     else:
         latest_res = ctx.reservations[-1] if (ctx and ctx.reservations) else None
-        if latest_res is None and state.get("execution_mode") == "live":
+        if latest_res is None and is_live:
             alt_chk = check_alternative_parts_impl(req_part)
             if alt_chk.get("has_qualified_in_stock_alternative"):
                 latest_res = reserve_spare_part_impl(str(alt_chk["compatible_alt_code"]), 1, ticket_id)
@@ -1622,7 +2157,14 @@ def stock_agent_node(state: MaintenanceState) -> Dict[str, Any]:
         audit_notes=notes,
     )
 
-    if report.get("awaiting_sql_approval"):
+    if is_live and raw_llm_json.get("reasoning"):
+        stock_thinking = str(raw_llm_json["reasoning"])
+        stock_delegate = (
+            "orchestrator -> Human QA (SQL_MUTATION)"
+            if report.get("awaiting_sql_approval")
+            else ("orchestrator -> field_technician" if report.get("reserved") else "orchestrator (ESCALATE)")
+        )
+    elif report.get("awaiting_sql_approval"):
         if is_tr:
             stock_thinking = (
                 f"OEM {req_part} için SQLite stoğu sorgulandı. "
@@ -1661,20 +2203,23 @@ def stock_agent_node(state: MaintenanceState) -> Dict[str, Any]:
                 f"Human SQL permission confirmed. Executed atomic SQLite reservation for 1x {report.get('reserved_part_code')} "
                 f"(${report.get('unit_cost_usd', 0):,.2f}, bin {report.get('bin_location')}). "
                 f"Remaining qty={report.get('remaining_stock_qty')}."
-                + (f" Auto-PO {pr_result.get('pr_id')} open." if pr_result.get("created") else "")
+                + (f" Auto-PO {pr_result.get('pr_id')} open." if pr_result.get('created') else "")
             )
             stock_delegate = "orchestrator -> field_technician (Cost Gate)"
     else:
         stock_thinking = f"Stok tükendi / Stock check failed: {req_part} = 0."
         stock_delegate = "orchestrator (ESCALATE)"
 
-    stock_actions = [f"query_inventory_sql('{req_part}')"]
-    if pr_result.get("created"):
-        stock_actions.append(f"Auto-PO Drafted: {pr_result.get('pr_id')} ({pr_result.get('order_qty')}x)")
-    if report.get("reserved"):
-        stock_actions.append(f"SQLite Reserved 1x {report.get('reserved_part_code')} -> rem {report.get('remaining_stock_qty')}")
-    elif report.get("awaiting_sql_approval"):
-        stock_actions.append(f"Prepared SQL Write Preview ({report.get('proposed_part_code')})")
+    if is_live and executed_tools:
+        stock_actions = [f"{ex['tool']}({json.dumps(ex.get('args', {}), ensure_ascii=False)})" for ex in executed_tools]
+    else:
+        stock_actions = [f"query_inventory_sql('{req_part}')"]
+        if pr_result.get("created"):
+            stock_actions.append(f"Auto-PO Drafted: {pr_result.get('pr_id')} ({pr_result.get('order_qty')}x)")
+        if report.get("reserved"):
+            stock_actions.append(f"SQLite Reserved 1x {report.get('reserved_part_code')} -> rem {report.get('remaining_stock_qty')}")
+        elif report.get("awaiting_sql_approval"):
+            stock_actions.append(f"Prepared SQL Write Preview ({report.get('proposed_part_code')})")
 
     stock_trace = _make_trace(
         node="stock_agent",
@@ -1687,6 +2232,8 @@ def stock_agent_node(state: MaintenanceState) -> Dict[str, Any]:
         delegated_to=stock_delegate,
         timestamp_utc=audit_entry["timestamp_utc"],
         lang=lang_code,
+        decision_source="LIVE_LLM" if is_live else "OFFLINE_DEMO",
+        llm_raw_payload={"llm_json": raw_llm_json, "tool_calls": executed_tools} if (is_live and (executed_tools or raw_llm_json)) else None,
     )
 
     return {
@@ -1725,12 +2272,15 @@ def field_technician_node(state: MaintenanceState) -> Dict[str, Any]:
         if state.get("engineering_replan_done") and replan
         else f"{diag.get('sop_code', 'SOP-MNT-001')} p.{diag.get('page_number', 2)}"
     )
+    is_live = state.get("execution_mode") != "offline_demo"
     is_tr = str(state.get("language", "en")).lower() == "tr"
     lang_code = "tr" if is_tr else "en"
     new_tool_calls: List[Dict[str, Any]] = []
+    executed_tools: List[Dict[str, Any]] = []
+    raw_llm_json: Dict[str, Any] = {}
     effective_model = state["llm_model"]
 
-    if state.get("execution_mode") == "offline_demo":
+    if not is_live:
         rep_res = execute_part_replacement_impl(
             machine_id=machine_id,
             old_part=f"WORN-{diag.get('required_part_code', part_code)}",
@@ -1767,7 +2317,7 @@ def field_technician_node(state: MaintenanceState) -> Dict[str, Any]:
                 "You are the Tier 1 Field Maintenance Technician.\n"
                 "1. Call execute_part_replacement(machine_id, old_part, new_part, sop_ref) following SOP or Engineer prescription.\n"
                 "2. ALWAYS call run_post_repair_vibration_test(machine_id) afterwards.\n"
-                "Return JSON with attempt_number and post_repair_vibration_rms."
+                "Return JSON with attempt_number, post_repair_vibration_rms, and reasoning."
                 + _lang_prompt_hint(state)
             )
             task_prompt = (
@@ -1790,9 +2340,10 @@ def field_technician_node(state: MaintenanceState) -> Dict[str, Any]:
                     pacing_delay=float(state.get("pacing_delay_sec", 0.3)),
                 )
 
-            (_, executed), effective_model, _ = _invoke_live_with_model_fallback(state, _call_tech)
-            for ex in executed:
+            (raw_text, executed_tools), effective_model, _ = _invoke_live_with_model_fallback(state, _call_tech)
+            for ex in executed_tools:
                 new_tool_calls.append({"agent": "Field Technician (Tier 1)", **ex})
+            raw_llm_json = _safe_parse_json(raw_text)
         except Exception as exc:
             return {
                 "last_worker": "field_technician",
@@ -1846,12 +2397,10 @@ def field_technician_node(state: MaintenanceState) -> Dict[str, Any]:
         audit_notes=notes,
     )
 
-    tech_trace = _make_trace(
-        node="field_technician",
-        tier="Tier 1 Shop-Floor Execution",
-        agent_name="Field Maintenance Technician",
-        command_received=str(state.get("current_instruction") or f"Execute LOTO & {action_label}"),
-        thinking=(
+    tech_think = (
+        str(raw_llm_json.get("reasoning") or f"Completed {action_label}; measured post-repair RMS {latest_rms:.2f} mm/s (Limit {GMP_VIBRATION_LIMIT_RMS}).")
+        if is_live
+        else (
             f"Onaylı iş emri tamamlandı (Deneme #{attempt_count}): {report['procedure_executed']}. Onarım sonrası akselerometre doğrulaması: {latest_rms:.2f} mm/s RMS (Limit {GMP_VIBRATION_LIMIT_RMS}) "
             + ("-> cGMP UYGUN." if passed else "-> LİMİT AŞILDI! Güvenilirlik Mühendisine YUKARI eskalasyon başlatılıyor!")
             if is_tr
@@ -1860,11 +2409,24 @@ def field_technician_node(state: MaintenanceState) -> Dict[str, Any]:
                 f"Ran post-repair tri-axial accelerometer verification -> {latest_rms:.2f} mm/s RMS vs {GMP_VIBRATION_LIMIT_RMS} limit "
                 + ("(WITHIN cGMP ZONE A/B)." if passed else "(EXCEEDS cGMP LIMIT -> Halting handoff; escalating UP to Reliability Engineer!).")
             )
-        ),
-        actions_taken=[
+        )
+    )
+    tech_actions = (
+        [f"{ex['tool']}({json.dumps(ex.get('args', {}), ensure_ascii=False)})" for ex in executed_tools]
+        if (is_live and executed_tools)
+        else [
             f"execute_part_replacement('{machine_id}', '{part_code}', '{sop_ref}')",
             f"run_post_repair_vibration_test('{machine_id}') -> {latest_rms:.2f} mm/s",
-        ],
+        ]
+    )
+
+    tech_trace = _make_trace(
+        node="field_technician",
+        tier="Tier 1 Shop-Floor Execution",
+        agent_name="Field Maintenance Technician",
+        command_received=str(state.get("current_instruction") or f"Execute LOTO & {action_label}"),
+        thinking=tech_think,
+        actions_taken=tech_actions,
         output_verdict=notes,
         delegated_to=(
             ("orchestrator -> qa_clearance (Kapı 3B GEÇTİ)" if is_tr else "orchestrator -> qa_clearance (Gate 3B PASS)")
@@ -1873,6 +2435,8 @@ def field_technician_node(state: MaintenanceState) -> Dict[str, Any]:
         ),
         timestamp_utc=audit_entry["timestamp_utc"],
         lang=lang_code,
+        decision_source="LIVE_LLM" if is_live else "OFFLINE_DEMO",
+        llm_raw_payload={"llm_json": raw_llm_json, "tool_calls": executed_tools} if is_live else None,
     )
 
     return {
@@ -1908,12 +2472,15 @@ def qa_clearance_node(state: MaintenanceState) -> Dict[str, Any]:
     ticket_id = state["ticket_id"]
     maint = state.get("maintenance_report", {})
     final_rms = float(maint.get("post_repair_vibration_rms", 1.5))
+    is_live = state.get("execution_mode") != "offline_demo"
     is_tr = str(state.get("language", "en")).lower() == "tr"
     lang_code = "tr" if is_tr else "en"
     new_tool_calls: List[Dict[str, Any]] = []
+    executed_tools: List[Dict[str, Any]] = []
+    raw_llm_json: Dict[str, Any] = {}
     effective_model = state["llm_model"]
 
-    if state.get("execution_mode") == "offline_demo":
+    if not is_live:
         clearance_res = run_qa_line_clearance_impl(machine_id, ticket_id, final_rms)
         new_tool_calls.append(
             {
@@ -1929,7 +2496,7 @@ def qa_clearance_node(state: MaintenanceState) -> Dict[str, Any]:
             sys_prompt = (
                 "You are the Tier 3 QA Line Clearance Officer.\n"
                 "Call run_qa_line_clearance(machine_id, ticket_id, final_vibration_rms) to verify LOTO removal, "
-                "tool reconciliation, sanitation wipe/CIP, and 10-min stability. Return JSON summary."
+                "tool reconciliation, sanitation wipe/CIP, and 10-min stability. Return JSON summary including reasoning."
                 + _lang_prompt_hint(state)
             )
             task_prompt = f"Ticket: {ticket_id} | Machine: {machine_id} | Final RMS: {final_rms}"
@@ -1949,10 +2516,16 @@ def qa_clearance_node(state: MaintenanceState) -> Dict[str, Any]:
                     pacing_delay=float(state.get("pacing_delay_sec", 0.3)),
                 )
 
-            (_, executed), effective_model, _ = _invoke_live_with_model_fallback(state, _call_clear)
-            for ex in executed:
+            (raw_text, executed_tools), effective_model, _ = _invoke_live_with_model_fallback(state, _call_clear)
+            for ex in executed_tools:
                 new_tool_calls.append({"agent": "QA Line Clearance", **ex})
-            clearance_res = run_qa_line_clearance_impl(machine_id, ticket_id, final_rms)
+            raw_llm_json = _safe_parse_json(raw_text)
+            ctx_c = get_active_run_context()
+            clearance_res = (
+                ctx_c.clearance_report
+                if (ctx_c and ctx_c.clearance_report)
+                else run_qa_line_clearance_impl(machine_id, ticket_id, final_rms)
+            )
         except Exception as exc:
             return {
                 "last_worker": "qa_clearance",
@@ -1973,24 +2546,37 @@ def qa_clearance_node(state: MaintenanceState) -> Dict[str, Any]:
         audit_notes=notes,
     )
 
-    clr_trace = _make_trace(
-        node="qa_clearance",
-        tier="Tier 3 Quality Assurance",
-        agent_name="QA Line Clearance Officer",
-        command_received=str(state.get("current_instruction") or f"Execute cGMP Line Clearance on {machine_id}"),
-        thinking=(
+    clr_think = (
+        str(raw_llm_json.get("reasoning") or f"QA Line Clearance executed via run_qa_line_clearance -> {clearance_res['line_status_after_clearance']} ({final_rms:.2f} mm/s).")
+        if is_live
+        else (
             f"{machine_id} üzerinde onarım sonrası kararlılık ({final_rms:.2f} mm/s <= {GMP_VIBRATION_LIMIT_RMS}), 480V EKED kilit sökümü, %100 alet sayımı ve hijyenik IPA/CIP temizliği doğrulandı."
             if is_tr
             else (
                 f"Audited post-repair stability ({final_rms:.2f} mm/s <= {GMP_VIBRATION_LIMIT_RMS}), 480V LOTO padlock removal, "
                 f"100% tool accountability count, and cleanroom IPA/CIP flush completion on {machine_id}."
             )
-        ),
-        actions_taken=[f"run_qa_line_clearance('{machine_id}', final_rms={final_rms:.2f}) -> {clearance_res['line_status_after_clearance']}"],
+        )
+    )
+    clr_actions = (
+        [f"{ex['tool']}({json.dumps(ex.get('args', {}), ensure_ascii=False)})" for ex in executed_tools]
+        if (is_live and executed_tools)
+        else [f"run_qa_line_clearance('{machine_id}', final_rms={final_rms:.2f}) -> {clearance_res['line_status_after_clearance']}"]
+    )
+
+    clr_trace = _make_trace(
+        node="qa_clearance",
+        tier="Tier 3 Quality Assurance",
+        agent_name="QA Line Clearance Officer",
+        command_received=str(state.get("current_instruction") or f"Execute cGMP Line Clearance on {machine_id}"),
+        thinking=clr_think,
+        actions_taken=clr_actions,
         output_verdict=notes,
         delegated_to="orchestrator -> analyst_capa",
         timestamp_utc=audit_entry["timestamp_utc"],
         lang=lang_code,
+        decision_source="LIVE_LLM" if is_live else "OFFLINE_DEMO",
+        llm_raw_payload={"llm_json": raw_llm_json, "tool_calls": executed_tools} if is_live else None,
     )
 
     return {
@@ -2021,31 +2607,35 @@ def analyst_capa_node(state: MaintenanceState) -> Dict[str, Any]:
     diag = state.get("diagnostic_report", {})
     inv = state.get("inventory_report", {})
     maint = state.get("maintenance_report", {})
+    is_live = state.get("execution_mode") != "offline_demo"
     is_tr = str(state.get("language", "en")).lower() == "tr"
     lang_code = "tr" if is_tr else "en"
     new_tool_calls: List[Dict[str, Any]] = []
+    executed_tools: List[Dict[str, Any]] = []
+    raw_llm_json: Dict[str, Any] = {}
     effective_model = state["llm_model"]
+    no_part = _is_no_part_case(state)
 
-    sop_ref = f"{diag.get('sop_code', 'SOP-MNT-001')} p.{diag.get('page_number', 2)}"
+    sop_ref = f"{diag.get('sop_code', 'SOP-MNT-001')} p.{diag.get('page_number', 1)}"
     failure_mode = str(diag.get("failure_mode", state["alarm_type"]))
     payload = {
         "ticket_id": state["ticket_id"],
         "machine_id": state["machine_id"],
         "failure_mode": failure_mode,
         "sop_ref": sop_ref,
-        "part_used": inv.get("reserved_part_code", diag.get("required_part_code", "BRG-4402")),
-        "used_alternative": bool(inv.get("used_alternative", False)),
-        "part_cost_usd": float(inv.get("unit_cost_usd", 0.0)),
+        "part_used": "NONE" if no_part else inv.get("reserved_part_code", diag.get("required_part_code", "BRG-4402")),
+        "used_alternative": False if no_part else bool(inv.get("used_alternative", False)),
+        "part_cost_usd": 0.0 if no_part else float(inv.get("unit_cost_usd", 0.0)),
         "alarm_vibration_rms": float(state["alarm_vibration_rms"]),
-        "final_vibration_rms": float(maint.get("post_repair_vibration_rms", 1.5)),
-        "repair_attempts": int(maint.get("attempt_count", 1)),
+        "final_vibration_rms": float(maint.get("post_repair_vibration_rms", state["alarm_vibration_rms"] if no_part else 1.5)),
+        "repair_attempts": 0 if no_part else int(maint.get("attempt_count", 1)),
     }
 
     analytics_res: Optional[Dict[str, Any]] = None
     capa_res: Optional[Dict[str, Any]] = None
     excel_res: Optional[Dict[str, Any]] = None
 
-    if state.get("execution_mode") == "offline_demo":
+    if not is_live:
         analytics_res = log_incident_analytics_impl(payload)
         capa_res = create_capa_if_repeat_failure_impl(state["machine_id"], state["ticket_id"], failure_mode, sop_ref)
         excel_res = generate_monthly_excel_report_impl()
@@ -2078,10 +2668,10 @@ def analyst_capa_node(state: MaintenanceState) -> Dict[str, Any]:
         try:
             sys_prompt = (
                 "You are the Quality, Cost & CAPA Analyst.\n"
-                "1. Call log_incident_analytics(ticket_data).\n"
+                "1. Call log_incident_analytics(ticket_data='<valid JSON string>') — MUST pass ONE JSON-serialized string parameter named 'ticket_data'.\n"
                 "2. Call create_capa_if_repeat_failure(machine_id, ticket_id, failure_mode, sop_ref).\n"
                 "3. Call generate_monthly_excel_report().\n"
-                "Return JSON summary." + _lang_prompt_hint(state)
+                "Return JSON summary including reasoning." + _lang_prompt_hint(state)
             )
             task_prompt = (
                 f"Closed Ticket Payload:\n{json.dumps(payload, indent=2)}\n"
@@ -2103,9 +2693,10 @@ def analyst_capa_node(state: MaintenanceState) -> Dict[str, Any]:
                     pacing_delay=float(state.get("pacing_delay_sec", 0.3)),
                 )
 
-            (_, executed), effective_model, _ = _invoke_live_with_model_fallback(state, _call_analyst)
-            for ex in executed:
+            (raw_text, executed_tools), effective_model, _ = _invoke_live_with_model_fallback(state, _call_analyst)
+            for ex in executed_tools:
                 new_tool_calls.append({"agent": "Quality & CAPA Analyst", **ex})
+            raw_llm_json = _safe_parse_json(raw_text)
         except Exception as exc:
             return {
                 "last_worker": "analyst_capa",
@@ -2154,12 +2745,10 @@ def analyst_capa_node(state: MaintenanceState) -> Dict[str, Any]:
         audit_notes=notes,
     )
 
-    analyst_trace = _make_trace(
-        node="analyst_capa",
-        tier="Tier 2/3 Financial & Quality Analytics",
-        agent_name="Quality, Cost & CAPA Analyst",
-        command_received=str(state.get("current_instruction") or f"Compute KPIs, check 30d repeat CAPA & export Excel for {state['ticket_id']}"),
-        thinking=(
+    an_think = (
+        str(raw_llm_json.get("reasoning") or f"Analyst computed impact ${report['total_cost_usd']:,.2f} ({report['damage_severity']}) across {report['downtime_minutes']}m and generated 4-sheet .xlsx.")
+        if is_live
+        else (
             f"Duruş={report['downtime_minutes']}dk (MTTR={report['mttr_minutes']}dk, Müdahale={report['repair_attempts']}). "
             f"Toplam Maliyet: ${report['part_cost_usd']:.2f} parça + ${report['labor_cost_usd']:.2f} işçilik + ${report['production_loss_usd']:,.2f} duruş = ${report['total_cost_usd']:,.2f} ({report['damage_severity']}). 30 günlük tekrar eşiği denetlendi."
             if is_tr
@@ -2169,16 +2758,31 @@ def analyst_capa_node(state: MaintenanceState) -> Dict[str, Any]:
                 f"${report['labor_cost_usd']:.2f} labor + ${report['production_loss_usd']:,.2f} stoppage = "
                 f"${report['total_cost_usd']:,.2f} ({report['damage_severity']}). Checked 30d asset history for repeat-failure CAPA."
             )
-        ),
-        actions_taken=[
+        )
+    )
+    an_actions = (
+        [f"{ex['tool']}({json.dumps(ex.get('args', {}), ensure_ascii=False)})" for ex in executed_tools]
+        if (is_live and executed_tools)
+        else [
             f"log_incident_analytics -> Total ${report['total_cost_usd']:,.2f}",
             f"create_capa_if_repeat_failure -> {capa_res.get('capa_id') if capa_res.get('capa_triggered') else 'No CAPA needed'}",
             "generate_monthly_excel_report() -> 4-Sheet .xlsx",
-        ],
+        ]
+    )
+
+    analyst_trace = _make_trace(
+        node="analyst_capa",
+        tier="Tier 2/3 Financial & Quality Analytics",
+        agent_name="Quality, Cost & CAPA Analyst",
+        command_received=str(state.get("current_instruction") or f"Compute KPIs, check 30d repeat CAPA & export Excel for {state['ticket_id']}"),
+        thinking=an_think,
+        actions_taken=an_actions,
         output_verdict=notes,
         delegated_to="orchestrator (Kapı 4 Nihai İmza)" if is_tr else "orchestrator (Gate 4 Final Closure & Sign-Off)",
         timestamp_utc=audit_entry["timestamp_utc"],
         lang=lang_code,
+        decision_source="LIVE_LLM" if is_live else "OFFLINE_DEMO",
+        llm_raw_payload={"llm_json": raw_llm_json, "tool_calls": executed_tools} if is_live else None,
     )
 
     return {
