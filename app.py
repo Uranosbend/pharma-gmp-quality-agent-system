@@ -1145,11 +1145,14 @@ with st.sidebar:
 
     st.markdown(t(lang, "sys_config"))
 
+    has_server_key = bool(resolve_api_key("groq")[0] or resolve_api_key("gemini")[0])
+    default_exec_idx = 0 if has_server_key else 1
+
     execution_mode = st.radio(
         t(lang, "exec_engine"),
         options=["live", "offline_demo"],
         format_func=lambda m: t(lang, "mode_live") if m == "live" else t(lang, "mode_offline"),
-        index=0,
+        index=default_exec_idx,
         key="exec_mode_radio",
         help=t(lang, "mode_help"),
     )
@@ -1204,6 +1207,8 @@ with st.sidebar:
 
     if execution_mode == "offline_demo":
         st.info(t(lang, "offline_badge_info"))
+        if sidebar_api_key.strip() and not mismatch_warn:
+            st.success(t(lang, "offline_byok_ready"))
     elif not p_cfg["requires_key"]:
         st.success(f"🟢 Ollama: {resolved_key}")
     elif resolved_key and not mismatch_warn:

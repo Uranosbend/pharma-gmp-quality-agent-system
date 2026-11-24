@@ -1,6 +1,10 @@
 # PharmaGMP Plant 04 — 3-Tier Hierarchical Multi-Agent Orchestra & Quality Control Tower
 
-A lightweight, presentation-ready **GMP / ALCOA+ Hierarchical Multi-Agent Maintenance & Quality Management System** built with **LangGraph** and **Streamlit** that runs smoothly locally and on **Streamlit Community Cloud (free tier, 1GB RAM limit)**.
+A lightweight, portfolio-ready **GMP / ALCOA+ Hierarchical Multi-Agent Maintenance & Quality Management System** built with **LangGraph** and **Streamlit** that runs smoothly locally and on **Streamlit Community Cloud (free tier, 1GB RAM limit)**.
+
+- **Live Public Demo:** https://pharma-gmp-quality-agen-hawzbdq3lonptktfsonj4v.streamlit.app/
+  - Opens directly in **Offline Safe Demo Mode** (no API key required) with full interactive LangGraph orchestration, Hybrid PDF RAG, SQLite inventory + Auto-PO, Human-in-the-Loop QA gates, 2-page PDF Closure Certificates, and 4-sheet `.xlsx` reports.
+  - Supports **Bring-Your-Own-Key (BYOK)** in the sidebar for **Groq Free**, **Google Gemini Free**, or **Ollama Local** if visitors want to run Live Autonomous LLM tool calls.
 
 ---
 
@@ -18,7 +22,7 @@ A lightweight, presentation-ready **GMP / ALCOA+ Hierarchical Multi-Agent Mainte
   - Pauses explicitly at the top of the dashboard for binding Human QA Approve/Deny decisions on SQLite inventory mutations (`SQL_MUTATION`) and estimated repair/rework budgets (`REPAIR_COST`, `REWORK_COST`).
   - Full live UI & AI output language toggle (**English** / **Türkçe**).
 - **100% Free-Tier LLM Support & Resilience (`src/llm_config.py`):**
-  - **Groq Free:** `openai/gpt-oss-120b`, `openai/gpt-oss-20b`, `qwen/qwen3.8-27b`, live `/models` discovery, automatic `404` model fallback, and `429` exponential backoff.
+  - **Groq Free:** `openai/gpt-oss-20b` (default), `openai/gpt-oss-120b`, `qwen/qwen3.8-27b`, live `/models` discovery, automatic `404` model fallback, and TPM/TPD rate-limit resilience.
   - **Google Gemini Free (AI Studio)** & **Ollama Local** + deterministic **Offline Safe Demo Mode**.
 
 ---
@@ -40,9 +44,9 @@ python tests/test_pipeline.py
 
 ---
 
-## Streamlit Community Cloud Publishing Guide (Tomorrow's Classroom Demo — 1-Click Public URL)
+## Self-Hosting & Streamlit Community Cloud Deployment
 
-To run this app directly in any browser on the smartboard **without bringing your laptop**:
+To host your own public or classroom instance:
 
 1. **Create a GitHub Repository & Push This Folder:**
    - Do **NOT** upload `.env` or `.streamlit/secrets.toml` (already blocked by `.gitignore`).
@@ -50,11 +54,11 @@ To run this app directly in any browser on the smartboard **without bringing you
 2. **Deploy on Streamlit Community Cloud (`share.streamlit.io`):**
    - Sign in with GitHub at **https://share.streamlit.io** and click **Create app** -> **Yup, I have an app**.
    - Pick your GitHub repository & branch, and set **Main file path** to `app.py`.
-3. **Add Your API Key Securely in Cloud Secrets:**
-   - Before or right after clicking **Deploy**, open **App Settings -> Secrets** and paste:
+3. **API Key Handling (Optional Secrets vs. Public Zero-Key Demo):**
+   - Leave **App Settings -> Secrets** empty for public portfolio sharing — the app automatically defaults to **Offline Safe Demo Mode** with no API key required, and visitors can optionally paste their own key (BYOK) in the sidebar.
+   - If you want Live LLM Mode pre-enabled for a private demo, add your key in **App Settings -> Secrets**:
      ```toml
      GROQ_API_KEY = "gsk_your_groq_key_here"
      ```
-   - Streamlit injects Secrets directly into `st.secrets` securely on the server without exposing your key in GitHub source code.
-4. **Open & Present Anywhere:**
-   - Share or bookmark the resulting `https://<your-app>.streamlit.app` URL (for classroom security, keep only a free-tier key with usage limits or clear/rotate it after presentation).
+4. **Open & Share:**
+   - Share your `https://<your-app>.streamlit.app` link safely with zero personal credentials exposed.

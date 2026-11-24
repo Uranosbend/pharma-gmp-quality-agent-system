@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import sqlite3
 import sys
 import unittest
@@ -549,9 +550,11 @@ class TestQualityAgentPipeline(unittest.TestCase):
 
         from streamlit.testing.v1 import AppTest
 
-        at = AppTest.from_file(str(ROOT_DIR / "app.py"), default_timeout=30)
-        at.run()
-        self.assertFalse(at.exception, f"Initial render raised: {at.exception}")
+        with patch.dict(os.environ, {"GROQ_API_KEY": "", "GOOGLE_API_KEY": "", "GEMINI_API_KEY": ""}, clear=False):
+            at = AppTest.from_file(str(ROOT_DIR / "app.py"), default_timeout=30)
+            at.run()
+            self.assertFalse(at.exception, f"Initial render raised: {at.exception}")
+            self.assertEqual(at.sidebar.radio(key="exec_mode_radio").value, "offline_demo")
 
         at.sidebar.radio(key="exec_mode_radio").set_value("offline_demo")
         at.sidebar.slider(key="watch_pacing_slider").set_value(0.0)
